@@ -1,0 +1,28 @@
+# Working documents — local only, not part of the repo
+Plan.md
+plan.md
+docs/plan.md
+logging.md
+
+# Environment
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Artefacts (all live under $STORAGE_PATH, never in the repo)
+storage/
+cache/
+trained_models/
+evaluation_results/
+trainer_output/
+logs/
+nohup.out
+*.npy
+*.parquet
+*.pt
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.DS_Store

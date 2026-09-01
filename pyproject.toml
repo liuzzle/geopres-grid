@@ -1,0 +1,39 @@
+[project]
+name = "geopres-grid"
+version = "0.1.0"
+description = "Combining dimensionality reduction and quantization for efficient embedding indexes."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "accelerate",
+    "datasets",
+    "huggingface-hub",
+    "mteb==2.15.1",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "python-dotenv",
+    "safetensors",
+    "scikit-learn",
+    "scipy",
+    "sentence-transformers==5.7.0",
+    "torch",
+    "tqdm",
+    "transformers==4.57.6",
+]
+
+[project.optional-dependencies]
+# Differentiable Spearman loss for the GeoPres projection. Builds from source and
+# needs the CUDA toolchain; imported lazily so the rest of the package works without it.
+# See README -> "torchsort".
+spearman = ["torchsort"]
+flash-attn = ["flash-attn>=2.5.0"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["geopres_grid"]
