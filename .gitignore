@@ -1,7 +1,7 @@
 # Working documents — local only, not part of the repo
-Plan.md
-plan.md
+docs/implementation-plan.md
 docs/plan.md
+docs/README-draft.md
 logging.md
 README-stand.md
 
@@ -27,3 +27,4 @@ nohup.out
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
