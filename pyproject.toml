@@ -6,7 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "accelerate",
     "datasets",
-    "huggingface-hub",
+    "huggingface-hub>=0.34.0,<1.0",
     "mteb==2.15.1",
     "numpy",
     "pandas",
@@ -15,10 +15,15 @@ dependencies = [
     "safetensors",
     "scikit-learn",
     "scipy",
-    "sentence-transformers==5.7.0",
+    # Floor at 5.7: lightonai/mDenseOn declares its modules under the refactored
+    # `sentence_transformers.base.modules.*` paths, absent before 5.4.
+    # Ceiling below 6.0 on supervisor guidance: 6.x introduces new bugs and
+    # compatibility issues. Do not raise without retesting the whole model set.
+    "sentence-transformers>=5.7.0,<6.0.0",
+    "tokenizers>=0.22.0,<=0.23.0",
     "torch",
     "tqdm",
-    "transformers==4.57.6",
+    "transformers==4.56.0",
 ]
 
 [project.optional-dependencies]
