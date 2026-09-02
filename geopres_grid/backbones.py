@@ -58,12 +58,30 @@ class Backbone:
     prompts: dict[str, str] | None = None
     """Prompt prefixes from `config_sentence_transformers.json`, if any."""
 
+    mrl_dims: tuple[int, ...] | None = None
+    """Dimensions the model was actually Matryoshka-trained at, per its paper.
+
+    None means MRL is not documented for this model -- which is not the same as
+    "not MRL-trained", only that we have no source. Truncating an MRL-trained model
+    at a dimension outside this set is not a supported use of MRL; truncating a
+    non-MRL model at any dimension is a naive baseline. The distinction is the whole
+    reason truncation can be reported as a near-zero-overhead reduction method for
+    some models and only as a control for others.
+    """
+
+    mrl_source: str = ""
+    """Citation for `mrl_dims`, so the claim is auditable."""
+
     notes: str = ""
 
     @property
     def slug(self) -> str:
         """Filesystem-safe identifier, matching the old repo's convention."""
         return self.model_id.replace("/", "__")
+
+    def mrl_valid(self, dim: int) -> bool:
+        """Whether truncating to `dim` is a documented use of MRL for this model."""
+        return bool(self.mrl_dims) and dim in self.mrl_dims
 
     @property
     def has_asymmetric_prompts(self) -> bool:
@@ -94,6 +112,12 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=True,
             trust_remote_code=True,
             prompts=None,
+            # Paper eq. 3: D = {32k | k in N, k >= 1, 32k <= H}, H = 768.
+            mrl_dims=tuple(range(32, 768 + 1, 32)),
+            mrl_source=(
+                "mGTE, arXiv:2407.19669, §2.2 'Matryoshka Embedding' and eq. 3; "
+                "elastic-embedding results in §3.2"
+            ),
             notes=(
                 "Custom `NewModel` architecture loaded via auto_map. The reason the "
                 "repo pins transformers==4.57.6; newer versions break it at encode "
@@ -111,6 +135,12 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=False,
             trust_remote_code=False,
             prompts={"query": "query: ", "document": "document: "},
+            mrl_dims=(128, 256, 512, 768),
+            mrl_source=(
+                "DenseOn/LateOn, arXiv:2607.27178, §2 and appendix C.3: "
+                "'we apply Matryoshka Representation Learning (MRL) on the InfoNCE "
+                "loss with truncation dimensions {128, 256, 512, 768}'"
+            ),
             notes=(
                 "ModernBERT. Its modules.json uses the refactored "
                 "`sentence_transformers.base.modules.*` paths, which do not exist "
@@ -208,6 +238,20 @@ to read. Native lengths (8192 / 8192 / 512 / tokenizer / tokenizer) are a
 supplementary run, not the headline -- meeting 20.08 §6, "cross-model comparison
 needs a fixed max_seq_length or an explicit caveat".
 """
+
+
+def shared_mrl_dims(keys: list[str] | None = None) -> list[int]:
+    """Dimensions at which every named backbone supports MRL truncation.
+
+    Empty when any of them has no documented MRL support.
+    """
+    selected = [get(k) for k in keys] if keys else all_backbones()
+    if any(not b.mrl_dims for b in selected):
+        return []
+    common = set(selected[0].mrl_dims)
+    for b in selected[1:]:
+        common &= set(b.mrl_dims)
+    return sorted(common)
 
 
 def get(key: str) -> Backbone:

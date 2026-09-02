@@ -64,3 +64,45 @@ def test_asymmetric_prompt_detection():
     # Instruct-style query prompts only, so documents go unprefixed.
     assert backbones.get("harrier-270m").has_asymmetric_prompts
     assert backbones.get("harrier-06b").has_asymmetric_prompts
+
+
+# --- Matryoshka support -------------------------------------------------------
+# Two of the five backbones are MRL-trained. 
+
+
+@pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
+def test_mrl_claim_is_cited(backbone):
+    if backbone.mrl_dims:
+        assert backbone.mrl_source, f"{backbone.key} claims MRL dims with no source"
+
+
+@pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
+def test_mrl_dims_fit_the_model(backbone):
+    for dim in backbone.mrl_dims or ():
+        assert 0 < dim <= backbone.native_dim, (
+            f"{backbone.key} lists MRL dim {dim} outside 1..{backbone.native_dim}"
+        )
+
+
+def test_mrl_dims_match_the_papers():
+    # mGTE: D = {32k | k >= 1, 32k <= 768}
+    assert backbones.get("mgte").mrl_dims == tuple(range(32, 769, 32))
+    # mDenseOn: exactly the four dimensions named in appendix C.3
+    assert backbones.get("mdenseon").mrl_dims == (128, 256, 512, 768)
+
+
+def test_mrl_validity_check():
+    mgte = backbones.get("mgte")
+    mdenseon = backbones.get("mdenseon")
+    assert mgte.mrl_valid(192) and mdenseon.mrl_valid(256)
+    # 192 is a multiple of 32 but not one of mDenseOn's four trained dimensions.
+    assert not mdenseon.mrl_valid(192)
+    # A model with no documented MRL support is never MRL-valid.
+    assert not backbones.get("lfm25").mrl_valid(256)
+
+
+def test_shared_mrl_dims():
+    """The dimensions where an MRL comparison across both models is legitimate."""
+    assert backbones.shared_mrl_dims(["mgte", "mdenseon"]) == [128, 256, 512, 768]
+    # Not every backbone has documented MRL support, so there is no set for all five.
+    assert backbones.shared_mrl_dims() == []
