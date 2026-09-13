@@ -43,6 +43,13 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
 - **The registry is the source of truth.** Every fact the pipeline branches on —
   dimension, pinned sha, prompt handling, whether the stack normalises — lives in
   `geopres_grid/backbones.py`. Do not re-derive these inline; add a field.
+- **Never use Python's `hash()` for anything persisted.** It is salted per process.
+  Use `identity.config_hash`, which is `sha256` over key-sorted JSON. Anything that
+  names a directory, a file or a result row goes through it.
+- **Think before adding a field to `EncodeConfig`.** Its hash names a directory
+  holding GPU-hours of embeddings; a new hashed field invalidates every cache that
+  exists. Provenance that does not change the meaning of an embedding belongs in the
+  recorded-only block, not in the hash.
 - **Never hard-code a device.** Use `config.resolve_device()`. Evaluation must run
   on CPU; only precomputation needs a GPU.
 - **Large artefacts never enter the repo.** Everything goes under `$STORAGE_PATH`.

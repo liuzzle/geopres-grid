@@ -22,6 +22,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 from geopres_grid import backbones
+from geopres_grid.identity import EncodeConfig
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -112,8 +113,18 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
     if backbone.normalizes:
         check(abs(norm - 1.0) < 1e-3, f"stack ends in Normalize but ||v|| = {norm:.4f}")
 
+    # WP-B: the cache key this model would produce, built from the live object
+    # rather than from the registry, so it records what the encoder will actually do.
+    encode_config = EncodeConfig.from_model(
+        model,
+        model_id=backbone.model_id,
+        revision=backbone.revision,
+        device="cpu",
+    )
+
     del model
     return {
+        "encode_config": encode_config,
         "classes": classes,
         "dim": reported_dim,
         "native_max_seq": native_max_seq,
@@ -172,6 +183,13 @@ def main() -> int:
         print(f"  ||encode(probe)||  {result['norm']:.4f}")
         print(f"  asymmetric prompts {backbone.has_asymmetric_prompts}")
         print(f"  loaded in          {result['load_seconds']:.1f}s")
+        config = result["encode_config"]
+        print(f"  encode_config_hash {config.hash}")
+        for repo, sha in config.external_code_revisions:
+            state = sha[:12] if sha else "UNRESOLVED"
+            print(f"  external code      {repo} @ {state}")
+        if config.has_unpinned_code:
+            print("                     ^ revision could not be pinned")
         print("  modules")
         for i, cls in enumerate(result["classes"]):
             print(f"    [{i}] {cls}")
