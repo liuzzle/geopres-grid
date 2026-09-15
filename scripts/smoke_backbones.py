@@ -11,6 +11,12 @@ Everything here runs on CPU. No GPU is needed to establish that the model set lo
 
     uv run python scripts/smoke_backbones.py
     uv run python scripts/smoke_backbones.py --models mdenseon lfm25
+
+Backbones that cannot run under the installed `transformers` major are skipped with
+the command that would run them, rather than counted as failures -- the model set
+is split across two environments on purpose (see `envs/README.md`).
+
+    uv run --project envs/transformers5 python scripts/smoke_backbones.py
 """
 
 import argparse
@@ -160,14 +166,28 @@ def main() -> int:
     )
     max_seq_length = args.max_seq_length or None
 
+    major = backbones.installed_transformers_major()
+    runnable = [b for b in selected if major in b.transformers_majors]
+    skipped = [b for b in selected if major not in b.transformers_majors]
+
     print(f"sentence-transformers {__import__('sentence_transformers').__version__}")
     print(f"transformers          {__import__('transformers').__version__}")
     print(f"torch                 {torch.__version__}  (device: cpu)")
     print(f"applying max_seq_length = {max_seq_length or 'native'}\n")
 
+    if skipped:
+        print("skipped -- wrong environment for these:")
+        for backbone in skipped:
+            wants = ", ".join(
+                backbones.ENVIRONMENTS.get(m, f"transformers {m}.x")
+                for m in backbone.transformers_majors
+            )
+            print(f"  {backbone.key:<14} needs {wants}")
+        print()
+
     failures: list[tuple[str, str]] = []
 
-    for backbone in selected:
+    for backbone in runnable:
         print(f"{'=' * 72}\n{backbone.key}  --  {backbone.model_id}\n{'=' * 72}")
         try:
             result = probe(backbone, max_seq_length)
@@ -197,12 +217,16 @@ def main() -> int:
 
     print("=" * 72)
     if failures:
-        print(f"{len(failures)} of {len(selected)} backbones FAILED:")
+        print(f"{len(failures)} of {len(runnable)} backbones FAILED:")
         for key, message in failures:
             print(f"  {key}: {message}")
         return 1
 
-    print(f"All {len(selected)} backbones load and encode on CPU.")
+    tail = f" ({len(skipped)} skipped: other environment)" if skipped else ""
+    print(
+        f"All {len(runnable)} backbones runnable on transformers {major}.x "
+        f"load and encode on CPU.{tail}"
+    )
     return 0
 
 

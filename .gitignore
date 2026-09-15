@@ -28,3 +28,6 @@ nohup.out
 .ruff_cache/
 .DS_Store
 
+
+# Second environment (see envs/README.md); its lockfile IS committed
+envs/*/.venv/

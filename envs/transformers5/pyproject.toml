@@ -1,0 +1,64 @@
+# The transformers 5.x environment.
+#
+# Why this file exists, in one line: mGTE cannot run on transformers 5.x and
+# mDenseOn cannot run on 4.x, so one environment cannot hold the model set.
+#
+# The evidence, both from loading the models rather than from reading metadata:
+#
+#   mDenseOn on 4.x   tokenizer_config.json declares `tokenizer_class:
+#                     TokenizersBackend`, a class introduced in transformers
+#                     5.0.0. AutoTokenizer raises "Unrecognized processing class".
+#
+#   mGTE on 5.x       loads cleanly, then raises inside forward:
+#                     `rope_cos[position_ids]` with index 2308706573136907808.
+#                     transformers 5 changed how position_ids are defaulted and
+#                     mGTE's vendored modeling.py reads them raw. Its remote code
+#                     lives in Alibaba-NLP/new-impl, last committed 2024-08-11,
+#                     so no upstream fix is coming. Note that an out-of-bounds
+#                     read is the *lucky* outcome here: a different shape returns
+#                     wrong numbers silently.
+#
+# This project installs the geopres_grid package from the repo root and overrides
+# only the transformers/tokenizers pins. Everything else -- sentence-transformers,
+# mteb, the package code itself -- is shared, so the two environments cannot drift
+# apart in anything except the one axis they are meant to differ in.
+#
+#     uv sync  --project envs/transformers5
+#     uv run   --project envs/transformers5 python scripts/smoke_backbones.py
+#
+# The cache is environment-independent: it stores plain fp32 arrays, so DR,
+# quantization and scoring all run in the root environment no matter which
+# environment produced the embeddings.
+
+[project]
+name = "geopres-grid-tf5"
+version = "0.1.0"
+description = "transformers 5.x environment for the backbones that require it."
+requires-python = ">=3.12,<3.13"
+dependencies = ["geopres-grid"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+# Overrides, not constraints: the root package pins transformers==4.56.0, and an
+# override is the only thing that can win against a hard pin in a dependency.
+# Keep this list minimal -- every entry is a way for the two environments to
+# diverge in something other than the transformers major.
+# (Must stay above [tool.uv.sources]: in TOML, keys after a sub-table header
+# belong to that sub-table.)
+override-dependencies = [
+    "transformers>=5.0.0,<6.0.0",
+    "tokenizers>=0.23.0,<0.24.0",
+    # Found while building this environment, and worth reporting: the supervisor's
+    # tested pin set caps huggingface-hub below 1.0, but transformers 5.x requires
+    # >=1.3.0. So the environment split is not only about transformers -- the hub
+    # client major differs too, which is a second axis on which the two
+    # environments can behave differently (download, cache layout, auth).
+    "huggingface-hub>=1.3.0,<2.0",
+]
+
+[tool.uv.sources]
+geopres-grid = { path = "../..", editable = true }

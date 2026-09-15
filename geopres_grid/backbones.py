@@ -55,6 +55,17 @@ class Backbone:
     trust_remote_code: bool
     """Whether loading executes code from the model repo."""
 
+    transformers_majors: tuple[int, ...] = (4, 5)
+    """Major `transformers` versions this model actually runs on.
+
+    Not a guess from metadata -- every entry here was established by loading the
+    model and encoding with it. Two of the five are single-major: mGTE only works
+    on 4.x (on 5.x it loads and then dies inside `forward`, see its notes) and
+    mDenseOn only on 5.x (its tokenizer class does not exist before 5.0). There is
+    therefore no single environment that runs the whole model set; see
+    `ENVIRONMENTS` below.
+    """
+
     prompts: dict[str, str] | None = None
     """Prompt prefixes from `config_sentence_transformers.json`, if any."""
 
@@ -70,7 +81,18 @@ class Backbone:
     """
 
     mrl_source: str = ""
-    """Citation for `mrl_dims`, so the claim is auditable."""
+    """Citation for `mrl_dims` -- or, when `mrl_dims` is None and `mrl_checked` is
+    True, the record of where we looked and found nothing."""
+
+    mrl_checked: bool = False
+    """Whether the MRL question has actually been investigated for this model.
+
+    `mrl_dims=None, mrl_checked=False` means unknown. `mrl_dims=None,
+    mrl_checked=True` means we looked and found no documented MRL training. The
+    distinction exists because reading silence as absence is exactly the mistake
+    made on 02.09: mGTE's and mDenseOn's model cards say nothing about Matryoshka
+    and both turned out to be MRL-trained, per their papers.
+    """
 
     notes: str = ""
 
@@ -112,16 +134,23 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=True,
             trust_remote_code=True,
             prompts=None,
+            transformers_majors=(4,),
             # Paper eq. 3: D = {32k | k in N, k >= 1, 32k <= H}, H = 768.
             mrl_dims=tuple(range(32, 768 + 1, 32)),
             mrl_source=(
                 "mGTE, arXiv:2407.19669, §2.2 'Matryoshka Embedding' and eq. 3; "
                 "elastic-embedding results in §3.2"
             ),
+            mrl_checked=True,
             notes=(
                 "Custom `NewModel` architecture loaded via auto_map. The reason the "
-                "repo pins transformers==4.57.6; newer versions break it at encode "
-                "time. Caveat for WP-B: its remote code is fetched from the separate "
+                "repo stays on the transformers 4.x line. Retested on 5.16.1 "
+                "(02.09): it loads cleanly and then raises inside forward at "
+                "modeling.py:392, `rope_cos[position_ids]` with a garbage index, "
+                "because transformers 5 changed how position_ids are defaulted and "
+                "the vendored code reads them raw. No upstream fix is coming -- "
+                "Alibaba-NLP/new-impl's last commit predates the 5.x line. "
+                "Caveat for WP-B: its remote code is fetched from the separate "
                 "`Alibaba-NLP/new-impl` repo, which the `revision` above does not "
                 "pin -- so a pinned sha here does not fully pin the encode path."
             ),
@@ -135,24 +164,26 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=False,
             trust_remote_code=False,
             prompts={"query": "query: ", "document": "document: "},
+            transformers_majors=(5,),
             mrl_dims=(128, 256, 512, 768),
             mrl_source=(
                 "DenseOn/LateOn, arXiv:2607.27178, §2 and appendix C.3: "
                 "'we apply Matryoshka Representation Learning (MRL) on the InfoNCE "
                 "loss with truncation dimensions {128, 256, 512, 768}'"
             ),
+            mrl_checked=True,
             notes=(
                 "ModernBERT. Its modules.json uses the refactored "
                 "`sentence_transformers.base.modules.*` paths, which do not exist "
                 "before sentence-transformers 5.4. "
-                "BLOCKED: its tokenizer_config.json declares "
-                "`tokenizer_class: TokenizersBackend`, which was introduced in "
-                "transformers 5.0.0 and does not exist in the pinned 4.57.6 -- "
-                "AutoTokenizer raises 'Unrecognized processing class'. mGTE needs "
-                "the 4.57.6 pin, so the two models cannot share an environment "
-                "until that pin is retested against transformers 5.x. "
-                "Prompts below are from config_sentence_transformers.json and are "
-                "unverified against a load."
+                "Its tokenizer_config.json declares `tokenizer_class: "
+                "TokenizersBackend`, introduced in transformers 5.0.0, so it cannot "
+                "load on the 4.x line at all -- AutoTokenizer raises 'Unrecognized "
+                "processing class'. mGTE cannot load on 5.x. The two are therefore "
+                "permanently split across environments; this one belongs to "
+                "`envs/transformers5`. Verified there on 02.09: loads, encodes, and "
+                "every field above matches the live model (768-d, query:/document: "
+                "prompts, Transformer -> Pooling with no Normalize, norms ~43)."
             ),
         ),
         Backbone(
@@ -172,6 +203,10 @@ BACKBONES: dict[str, Backbone] = {
                 "positive": "document: ",
                 **{f"negative_{i}": "document: " for i in range(7)},
             },
+            mrl_checked=True,
+            mrl_source=(
+                "No MRL documented. Checked 15.09.2026: HF model card (LiquidAI/LFM2.5-Embedding-350M), the GGUF card, the release blog 'LFM2.5 Retrievers: Bi-directional LFMs for Fast Multilingual Search', and the Liquid docs page. The blog enumerates the full training recipe -- (1) English contrastive pretraining, (2) multilingual/cross-lingual distillation, (3) fine-tuning on hard-mined negatives -- with no nested or Matryoshka objective. No technical report exists. NOTE: web search attributes Matryoshka dims {2048, 1024, 512, 256} to *LFM2.5-230M*, a different (generative) model; it does not transfer to this checkpoint, and 2048 is not even reachable from this model's 1024-d output."
+            ),
             notes=(
                 "Shortest context of the five at 512 tokens, which is what sets "
                 "PRIMARY_MAX_SEQ_LENGTH below."
@@ -193,6 +228,10 @@ BACKBONES: dict[str, Backbone] = {
                 "sts_query": "Instruct: Retrieve semantically similar text\nQuery: ",
                 "bitext_query": "Instruct: Retrieve parallel sentences\nQuery: ",
             },
+            mrl_checked=True,
+            mrl_source=(
+                "No MRL documented. Checked 15.09.2026: HF model cards for both harrier checkpoints, the Microsoft Foundry Labs page, and the Bing blog release post. Training is described as contrastive learning plus knowledge distillation from a larger teacher, with no nested objective. No arXiv technical report exists for harrier-oss-v1, so unlike mGTE and mDenseOn there is no paper that could contradict the cards -- which is why this is recorded as 'no evidence found' rather than as a settled negative."
+            ),
             notes=(
                 "Gemma-3 based. Carries the same instruct-style query prompts as the "
                 "0.6b checkpoint -- the registry originally recorded none, which the "
@@ -218,6 +257,10 @@ BACKBONES: dict[str, Backbone] = {
                 "sts_query": "Instruct: Retrieve semantically similar text\nQuery: ",
                 "bitext_query": "Instruct: Retrieve parallel sentences\nQuery: ",
             },
+            mrl_checked=True,
+            mrl_source=(
+                "No MRL documented. Checked 15.09.2026: HF model cards for both harrier checkpoints, the Microsoft Foundry Labs page, and the Bing blog release post. Training is described as contrastive learning plus knowledge distillation from a larger teacher, with no nested objective. No arXiv technical report exists for harrier-oss-v1, so unlike mGTE and mDenseOn there is no paper that could contradict the cards -- which is why this is recorded as 'no evidence found' rather than as a settled negative."
+            ),
             notes=(
                 "Qwen3 based. Instruct-style query prompts with no matching document "
                 "prompt, so the query side is prefixed and the document side is not. "
@@ -238,6 +281,65 @@ to read. Native lengths (8192 / 8192 / 512 / tokenizer / tokenizer) are a
 supplementary run, not the headline -- meeting 20.08 §6, "cross-model comparison
 needs a fixed max_seq_length or an explicit caveat".
 """
+
+
+ENVIRONMENTS: dict[int, str] = {
+    4: "the project root environment (`uv sync`)",
+    5: "`envs/transformers5` (`uv sync --project envs/transformers5`)",
+}
+"""Which environment provides which `transformers` major.
+
+The split is not a preference. mGTE cannot run on 5.x and mDenseOn cannot run on
+4.x, both established by loading them rather than by reading metadata, and neither
+has an upstream fix pending. Three of the five backbones run in either, so the only
+cross-environment cost is that a run covering the whole model set is two commands.
+
+Everything downstream of the cache is unaffected: the cache stores plain fp32
+arrays, so DR, quantization and scoring all happen in one environment regardless of
+which one produced the embeddings.
+"""
+
+
+def installed_transformers_major() -> int:
+    """Major version of the `transformers` actually installed in this interpreter."""
+    import transformers
+
+    return int(transformers.__version__.split(".")[0])
+
+
+def runnable_backbones(major: int | None = None) -> list[Backbone]:
+    """Backbones that can load under this `transformers` major version."""
+    major = installed_transformers_major() if major is None else major
+    return [b for b in all_backbones() if major in b.transformers_majors]
+
+
+def require_runnable(backbone: Backbone, major: int | None = None) -> None:
+    """Fail early, and with the fix, when a backbone is in the wrong environment.
+
+    Without this the failure surfaces as `Unrecognized processing class` (mDenseOn
+    on 4.x) or as an IndexError inside `forward` with a nonsense index (mGTE on
+    5.x), neither of which names the actual problem.
+    """
+    major = installed_transformers_major() if major is None else major
+    if major in backbone.transformers_majors:
+        return
+    supported = ", ".join(
+        f"{m}.x -> {ENVIRONMENTS.get(m, 'unregistered environment')}"
+        for m in backbone.transformers_majors
+    )
+    raise RuntimeError(
+        f"{backbone.key} ({backbone.model_id}) does not run on transformers "
+        f"{major}.x. It needs: {supported}"
+    )
+
+
+def unchecked_mrl() -> list[Backbone]:
+    """Backbones whose MRL support has never been investigated.
+
+    Empty is the goal. A model in this list must not be described as "not
+    MRL-trained" -- only as unknown.
+    """
+    return [b for b in all_backbones() if not b.mrl_checked and not b.mrl_dims]
 
 
 def shared_mrl_dims(keys: list[str] | None = None) -> list[int]:

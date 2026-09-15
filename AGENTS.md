@@ -7,10 +7,21 @@ model set, the version rationale, and the work-package sequence.
 ## Quick start
 
 ```bash
-uv sync
-cp .env.example .env          # PROJECT_ROOT is required
+uv sync                                 # root environment: transformers 4.x
+uv sync --project envs/transformers5    # second environment: transformers 5.x
+cp .env.example .env                    # PROJECT_ROOT is required
 uv run python scripts/smoke_backbones.py
+uv run --project envs/transformers5 python scripts/smoke_backbones.py
 ```
+
+**There are two environments and there is no way around it.** mGTE runs only on
+`transformers` 4.x, mDenseOn only on 5.x; both established by loading the models. Ask
+`backbones.runnable_backbones()` rather than assuming, and call
+`backbones.require_runnable(backbone)` before any load — the native failures are an
+`Unrecognized processing class` and an `IndexError` with a nonsense index inside
+`forward`, neither of which names the real problem. Only precomputation is affected:
+the cache holds plain fp32 arrays, so everything downstream runs in one environment.
+See `envs/README.md`.
 
 This is a real installed package. Imports are absolute (`from geopres_grid.config
 import ...`) and there is no `PYTHONPATH` to set — unlike the upstream GeoPres repo,
@@ -26,10 +37,13 @@ which used bare imports plus `PYTHONPATH=geopres`.
 - `transformers==4.56.0`, `tokenizers>=0.22.0,<=0.23.0`,
   `huggingface-hub>=0.34.0,<1.0` — the combination the supervisor tested, verified
   here on 4 of 5 backbones. Staying on the 4.x line also keeps
-  `Alibaba-NLP/gte-multilingual-base` working at encode time. **But the 4.x line
-  blocks `lightonai/mDenseOn`**, whose tokenizer needs transformers 5.x — see README,
-  "mDenseOn is blocked by the transformers major version". Unresolved; do not assume
-  all five backbones load.
+  `Alibaba-NLP/gte-multilingual-base` working at encode time. The 4.x line cannot run
+  `lightonai/mDenseOn`, which is why `envs/transformers5` exists. Resolved, but do not
+  assume all five backbones load **in one environment** — they never will.
+- `huggingface-hub>=0.34.0,<1.0` in the root; **`>=1.3.0` in `envs/transformers5`**,
+  because transformers 5.x requires it. The two environments therefore differ in the
+  hub-client major as well as in transformers. Overridden explicitly in
+  `envs/transformers5/pyproject.toml`, not left to the resolver.
 - `mteb==2.15.1` — work package G depends on `abstasks/retrieval.py` dispatching to
   a model that implements `SearchProtocol`. That is the hook for bit-exact scoring
   and it is version-sensitive. Re-verify it before bumping.
@@ -79,3 +93,7 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   overrides it on the reduced model.
 - **Three of five stacks end in `Normalize`, two do not.** Never append a projection
   to the module stack and assume a consistent input geometry.
+- **Silence in a model card is not evidence.** mGTE and mDenseOn were called non-MRL
+  on the basis of silent cards; both are MRL-trained per their papers. Every backbone
+  now carries `mrl_checked` plus a source for the claim in either direction, and
+  `tests/test_backbones.py` fails if any model is left in the unchecked state.
