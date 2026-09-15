@@ -106,3 +106,64 @@ def test_shared_mrl_dims():
     assert backbones.shared_mrl_dims(["mgte", "mdenseon"]) == [128, 256, 512, 768]
     # Not every backbone has documented MRL support, so there is no set for all five.
     assert backbones.shared_mrl_dims() == []
+
+
+def test_mrl_support_has_been_investigated_for_every_backbone():
+    """No backbone may sit in the 'nobody checked' state.
+
+    This is the 02.09 lesson encoded as a test: silence in a model card was read
+    as absence, and both models that were called non-MRL turned out to be
+    MRL-trained per their papers.
+    """
+    assert backbones.unchecked_mrl() == []
+
+
+@pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
+def test_mrl_claims_cite_a_source(backbone):
+    """Both directions need a citation: the dimension set, and the negative."""
+    if backbone.mrl_dims or backbone.mrl_checked:
+        assert backbone.mrl_source, f"{backbone.key} states an MRL claim with no source"
+
+
+def test_backbones_without_documented_mrl():
+    """Checked 15.09.2026; truncation is a naive baseline for these three."""
+    no_mrl = {b.key for b in backbones.all_backbones() if not b.mrl_dims}
+    assert no_mrl == {"lfm25", "harrier-270m", "harrier-06b"}
+
+
+@pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
+def test_every_backbone_has_an_environment(backbone):
+    assert backbone.transformers_majors
+    for major in backbone.transformers_majors:
+        assert major in backbones.ENVIRONMENTS, (
+            f"{backbone.key} claims transformers {major}.x, which no environment provides"
+        )
+
+
+def test_the_environment_split_is_exactly_mgte_and_mdenseon():
+    """If this ever fails, the split has changed and envs/README.md is stale."""
+    assert backbones.get("mgte").transformers_majors == (4,)
+    assert backbones.get("mdenseon").transformers_majors == (5,)
+    assert {b.key for b in backbones.runnable_backbones(4)} == {
+        "mgte", "lfm25", "harrier-270m", "harrier-06b"
+    }
+    assert {b.key for b in backbones.runnable_backbones(5)} == {
+        "mdenseon", "lfm25", "harrier-270m", "harrier-06b"
+    }
+
+
+def test_no_single_environment_runs_every_backbone():
+    """The claim the second environment exists for. Stated as a test so that an
+    upstream fix making it false shows up as a failure to celebrate."""
+    for major in backbones.ENVIRONMENTS:
+        assert len(backbones.runnable_backbones(major)) < len(backbones.all_backbones())
+
+
+def test_require_runnable_names_the_fix():
+    with pytest.raises(RuntimeError, match="envs/transformers5"):
+        backbones.require_runnable(backbones.get("mdenseon"), major=4)
+    with pytest.raises(RuntimeError, match="uv sync"):
+        backbones.require_runnable(backbones.get("mgte"), major=5)
+    # A backbone in the right environment passes silently.
+    backbones.require_runnable(backbones.get("lfm25"), major=4)
+    backbones.require_runnable(backbones.get("lfm25"), major=5)
