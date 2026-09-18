@@ -92,6 +92,26 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
             f"prompt mismatch:\n  registry: {backbone.prompts!r}\n  model:    {prompts!r}",
         )
 
+    # The per-side names are what encode() is actually called with, so a name the
+    # model does not declare is a ValueError at encode time -- except when a cache
+    # wrapper swallows it, in which case it is a silently unprefixed query instead.
+    # Catch it here, against the loaded model, rather than three work packages later.
+    for side in ("query", "document"):
+        name = backbone.prompt_name_for(side)
+        if name is None:
+            continue
+        check(
+            name in (model.prompts or {}),
+            f"registry uses prompt_name={name!r} for the {side} side, but the loaded "
+            f"model declares {sorted(model.prompts or {})}",
+        )
+        check(
+            (model.prompts or {}).get(name) == backbone.prompt_for(side),
+            f"{side} prefix mismatch for {name!r}:\n"
+            f"  registry: {backbone.prompt_for(side)!r}\n"
+            f"  model:    {(model.prompts or {}).get(name)!r}",
+        )
+
     native_max_seq = model.max_seq_length
     if backbone.native_max_seq_length is not None:
         check(
@@ -201,7 +221,9 @@ def main() -> int:
               + ("  (from tokenizer, model declares none)"
                  if backbone.native_max_seq_length is None else ""))
         print(f"  ||encode(probe)||  {result['norm']:.4f}")
-        print(f"  asymmetric prompts {backbone.has_asymmetric_prompts}")
+        print(f"  asymmetric prompts {backbone.has_asymmetric_prompts}"
+              f"  (query={backbone.prompt_name_for('query')!r}, "
+              f"document={backbone.prompt_name_for('document')!r})")
         print(f"  loaded in          {result['load_seconds']:.1f}s")
         config = result["encode_config"]
         print(f"  encode_config_hash {config.hash}")

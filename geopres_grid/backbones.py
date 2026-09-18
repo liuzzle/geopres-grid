@@ -69,6 +69,28 @@ class Backbone:
     prompts: dict[str, str] | None = None
     """Prompt prefixes from `config_sentence_transformers.json`, if any."""
 
+    query_prompt_name: str | None = None
+    """Key into `prompts` to use when encoding a **query**, or None for bare text.
+
+    A name rather than the prefix itself, because that is what
+    `SentenceTransformer.encode(prompt_name=...)` takes and what the model cards
+    document. Note that it is not always `"query"`: both harriers call their
+    retrieval prompt `web_search_query`, so code that hard-codes `"query"` gets
+    silently no prefix on those models. See `prompt_source`.
+    """
+
+    document_prompt_name: str | None = None
+    """Key into `prompts` to use when encoding a **document**, or None for bare text.
+
+    None alongside a non-None `query_prompt_name` is a deliberate asymmetry, not a
+    gap in the registry: the harrier cards encode documents with no prompt at all.
+    Adding one would be off-distribution for the model.
+    """
+
+    prompt_source: str = ""
+    """Citation for the two prompt-name fields -- where the query/document split is
+    documented, in the model's own words."""
+
     mrl_dims: tuple[int, ...] | None = None
     """Dimensions the model was actually Matryoshka-trained at, per its paper.
 
@@ -94,6 +116,21 @@ class Backbone:
     and both turned out to be MRL-trained, per their papers.
     """
 
+    mrl_probe: str = ""
+    """What the *empirical* prefix probe found, or "" if it has never been run.
+
+    `mrl_dims` and `mrl_source` record what a vendor documents. This records what
+    `scripts/probe_mrl.py` measured: at a fixed budget k, whether the first k
+    coordinates outperform an arbitrary k columns (the null) and how far they close
+    the gap to PCA (the reference). The two fields answer different questions and
+    can legitimately disagree -- an undocumented model can still behave like an MRL
+    model, which is exactly the possibility this field exists to settle.
+
+    `mrl_valid()` deliberately still keys off `mrl_dims` alone. A measurement on six
+    NanoBEIR tasks is evidence about the grid, not a licence to describe a model as
+    MRL-trained in the write-up.
+    """
+
     notes: str = ""
 
     @property
@@ -105,6 +142,31 @@ class Backbone:
         """Whether truncating to `dim` is a documented use of MRL for this model."""
         return bool(self.mrl_dims) and dim in self.mrl_dims
 
+    def prompt_name_for(self, side: str) -> str | None:
+        """Prompt name to pass to `encode` for `side` in ("query", "document")."""
+        if side == "query":
+            return self.query_prompt_name
+        if side == "document":
+            return self.document_prompt_name
+        raise ValueError(f"side must be 'query' or 'document', got {side!r}")
+
+    def prompt_for(self, side: str) -> str:
+        """The literal prefix prepended to text on `side`. Empty string when bare.
+
+        This is the string the cache key has to be built over: WP-C hashes the
+        *prompted* text, so `prompt_for(side) + text` is the thing that gets
+        hashed, not `text`.
+        """
+        name = self.prompt_name_for(side)
+        if name is None:
+            return ""
+        if not self.prompts or name not in self.prompts:
+            raise KeyError(
+                f"{self.key} names prompt {name!r} for the {side} side, but its "
+                f"prompts dict has {sorted(self.prompts or {})}"
+            )
+        return self.prompts[name]
+
     @property
     def has_asymmetric_prompts(self) -> bool:
         """True when the prefix applied depends on which side is being encoded.
@@ -112,14 +174,23 @@ class Backbone:
         A model that names a prompt for only one side counts as asymmetric: the
         query gets a prefix and the document goes bare, which is exactly the case
         a shared-text cache key gets wrong.
+
+        Resolved from `query_prompt_name` / `document_prompt_name` rather than by
+        guessing key names out of `prompts`. The earlier version looked up
+        `prompts["query"]` and `prompts["document"]`, which happened to return the
+        right answer for the harriers only because *neither* key exists there and
+        it fell through to True -- the right answer for the wrong reason, and it
+        would have been the wrong answer for any model naming only a document
+        prompt.
         """
-        if not self.prompts:
-            return False
-        query_prompt = self.prompts.get("query")
-        document_prompt = self.prompts.get("document")
-        if query_prompt is not None and document_prompt is not None:
-            return query_prompt != document_prompt
-        return True
+        return self.prompt_for("query") != self.prompt_for("document")
+
+
+PROBE = (
+    "Probed 18.09.2026, scripts/probe_mrl.py, NanoSciFact + NanoNFCorpus "
+    "(100 queries), max_seq_length=512, fp32. "
+)
+"""Shared provenance prefix for the `mrl_probe` strings below."""
 
 
 BACKBONES: dict[str, Backbone] = {
@@ -134,6 +205,14 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=True,
             trust_remote_code=True,
             prompts=None,
+            query_prompt_name=None,
+            document_prompt_name=None,
+            prompt_source=(
+                "No prompts. config_sentence_transformers.json declares none and the "
+                "model card's usage example calls encode() bare on both sides. The "
+                "only symmetric backbone of the five, so it is the one model whose "
+                "cache key is safe on raw text."
+            ),
             transformers_majors=(4,),
             # Paper eq. 3: D = {32k | k in N, k >= 1, 32k <= H}, H = 768.
             mrl_dims=tuple(range(32, 768 + 1, 32)),
@@ -142,6 +221,16 @@ BACKBONES: dict[str, Backbone] = {
                 "elastic-embedding results in §3.2"
             ),
             mrl_checked=True,
+            mrl_probe=(
+                PROBE + "POSITIVE CONTROL, and it behaves like one: truncation beats "
+                "random columns at k=32/64/128 with the 95% paired bootstrap on "
+                "trunc-rand excluding zero (+0.072 [+0.029, +0.117] at k=32), "
+                "mrl_gain +0.46/+0.51/+1.12. Variance in the first 32 coordinates is "
+                "0.071 against 0.042 for uniform (ratio 1.63), decaying toward 1.0 as "
+                "k grows -- front-loading, as the paper's eq. 3 implies. Loses "
+                "resolution at k>=256 where PCA stops beating random columns. This is "
+                "the band an undocumented model has to be read against."
+            ),
             notes=(
                 "Custom `NewModel` architecture loaded via auto_map. The reason the "
                 "repo stays on the transformers 4.x line. Retested on 5.16.1 "
@@ -164,6 +253,14 @@ BACKBONES: dict[str, Backbone] = {
             normalizes=False,
             trust_remote_code=False,
             prompts={"query": "query: ", "document": "document: "},
+            query_prompt_name="query",
+            document_prompt_name="document",
+            prompt_source=(
+                "Model card usage example: "
+                "`model.encode(queries, prompt_name=\"query\")` / "
+                "`model.encode(documents, prompt_name=\"document\")`; "
+                "prefixes read from config_sentence_transformers.json."
+            ),
             transformers_majors=(5,),
             mrl_dims=(128, 256, 512, 768),
             mrl_source=(
@@ -172,6 +269,21 @@ BACKBONES: dict[str, Backbone] = {
                 "loss with truncation dimensions {128, 256, 512, 768}'"
             ),
             mrl_checked=True,
+            mrl_probe=(
+                PROBE + "POSITIVE CONTROL, and the more informative of the two, "
+                "because it has a documented boundary the probe can be checked "
+                "against: its trained set is {128, 256, 512, 768}, so k=32 and k=64 "
+                "are *outside* it. That is roughly what comes out. trunc-rand is "
+                "+0.045 [+0.006, +0.086] at k=128 -- the bottom of the documented set, "
+                "and the only k where the interval excludes zero -- against +0.034 "
+                "[-0.020, +0.088] at k=32 and +0.037 [-0.006, +0.081] at k=64. "
+                "mrl_gain +0.39/+0.50/+0.93. Read carefully: the point estimates below "
+                "128 are positive and the intervals only just include zero, so this is "
+                "'not detectable at 100 queries', not 'absent'. The honest reading is "
+                "that the probe recovers the documented boundary without being told "
+                "where it is, which is the closest thing to a calibration this design "
+                "can offer."
+            ),
             notes=(
                 "ModernBERT. Its modules.json uses the refactored "
                 "`sentence_transformers.base.modules.*` paths, which do not exist "
@@ -203,9 +315,32 @@ BACKBONES: dict[str, Backbone] = {
                 "positive": "document: ",
                 **{f"negative_{i}": "document: " for i in range(7)},
             },
+            query_prompt_name="query",
+            document_prompt_name="document",
+            prompt_source=(
+                "Model card, 'Encoding queries and documents': 'Always pass "
+                "prompt_name=\"query\" for queries and prompt_name=\"document\" for "
+                "passages -- the model was trained with these prefixes, and omitting "
+                "them silently degrades retrieval quality.' The card's own training "
+                "snippet passes prompts={'query': 'query: ', 'positive': 'document: '}, "
+                "which is where the `positive`/`negative_i` aliases in `prompts` come "
+                "from: they are training-time role names, all resolving to the document "
+                "prefix. Checked 17.09.2026."
+            ),
             mrl_checked=True,
             mrl_source=(
                 "No MRL documented. Checked 15.09.2026: HF model card (LiquidAI/LFM2.5-Embedding-350M), the GGUF card, the release blog 'LFM2.5 Retrievers: Bi-directional LFMs for Fast Multilingual Search', and the Liquid docs page. The blog enumerates the full training recipe -- (1) English contrastive pretraining, (2) multilingual/cross-lingual distillation, (3) fine-tuning on hard-mined negatives -- with no nested or Matryoshka objective. No technical report exists. NOTE: web search attributes Matryoshka dims {2048, 1024, 512, 256} to *LFM2.5-230M*, a different (generative) model; it does not transfer to this checkpoint, and 2048 is not even reachable from this model's 1024-d output."
+            ),
+            mrl_probe=(
+                PROBE + "NO PREFIX PRIVILEGE. Truncation is statistically "
+                "indistinguishable from keeping k random columns at every k probed: "
+                "trunc-rand is +0.023 [-0.025, +0.071] at k=32 and within noise of "
+                "zero at 64/128/256, mrl_gain +0.15/-0.04/-0.06/+0.05. Variance in "
+                "the first 32 coordinates is 0.032 against 0.031 for uniform -- flat "
+                "to three decimals, no front-loading at all. So the documented "
+                "negative (mrl_dims=None) is confirmed by measurement rather than "
+                "inferred from silence. Truncating LFM2.5 is a naive baseline; it is "
+                "not, however, actively harmful the way it is on the harriers."
             ),
             notes=(
                 "Shortest context of the five at 512 tokens, which is what sets "
@@ -228,9 +363,30 @@ BACKBONES: dict[str, Backbone] = {
                 "sts_query": "Instruct: Retrieve semantically similar text\nQuery: ",
                 "bitext_query": "Instruct: Retrieve parallel sentences\nQuery: ",
             },
+            query_prompt_name="web_search_query",
+            document_prompt_name=None,
+            prompt_source=(
+                "Model card usage example, which is the only documentation of the "
+                "split: `query_embeddings = model.encode(queries, "
+                "prompt_name=\"web_search_query\")` followed by "
+                "`document_embeddings = model.encode(documents)` -- documents take no "
+                "prompt at all. Confirmed by the maintainers: 'Yes, this is how the "
+                "model is trained, otherwise you will see a performance degradation.' "
+                "The three declared prompts are all *query*-side and task-specific; "
+                "`web_search_query` is the retrieval one. Checked 17.09.2026."
+            ),
             mrl_checked=True,
             mrl_source=(
                 "No MRL documented. Checked 15.09.2026: HF model cards for both harrier checkpoints, the Microsoft Foundry Labs page, and the Bing blog release post. Training is described as contrastive learning plus knowledge distillation from a larger teacher, with no nested objective. No arXiv technical report exists for harrier-oss-v1, so unlike mGTE and mDenseOn there is no paper that could contradict the cards -- which is why this is recorded as 'no evidence found' rather than as a settled negative."
+            ),
+            mrl_probe=(
+                PROBE + "WORSE THAN RANDOM. Truncation loses to keeping k random "
+                "columns: trunc-rand -0.087 [-0.130, -0.043] at k=32 and -0.046 "
+                "[-0.088, -0.005] at k=128, both intervals excluding zero; k=64 is "
+                "not distinguishable. mrl_gain -0.52/-0.23/-0.75. Variance in the "
+                "first 32 coordinates 0.055 against 0.050 uniform -- essentially "
+                "flat. Truncation is therefore not merely a naive baseline here, it "
+                "is worse than the naive baseline, and the grid should say so."
             ),
             notes=(
                 "Gemma-3 based. Carries the same instruct-style query prompts as the "
@@ -257,14 +413,57 @@ BACKBONES: dict[str, Backbone] = {
                 "sts_query": "Instruct: Retrieve semantically similar text\nQuery: ",
                 "bitext_query": "Instruct: Retrieve parallel sentences\nQuery: ",
             },
+            query_prompt_name="web_search_query",
+            document_prompt_name=None,
+            prompt_source=(
+                "Model card usage example, which is the only documentation of the "
+                "split: `query_embeddings = model.encode(queries, "
+                "prompt_name=\"web_search_query\")` followed by "
+                "`document_embeddings = model.encode(documents)` -- documents take no "
+                "prompt at all. Confirmed by the maintainers: 'Yes, this is how the "
+                "model is trained, otherwise you will see a performance degradation.' "
+                "The three declared prompts are all *query*-side and task-specific; "
+                "`web_search_query` is the retrieval one. Checked 17.09.2026."
+            ),
             mrl_checked=True,
             mrl_source=(
                 "No MRL documented. Checked 15.09.2026: HF model cards for both harrier checkpoints, the Microsoft Foundry Labs page, and the Bing blog release post. Training is described as contrastive learning plus knowledge distillation from a larger teacher, with no nested objective. No arXiv technical report exists for harrier-oss-v1, so unlike mGTE and mDenseOn there is no paper that could contradict the cards -- which is why this is recorded as 'no evidence found' rather than as a settled negative."
             ),
+            mrl_probe=(
+                PROBE + "WORSE THAN RANDOM, by the largest margin of the five, which "
+                "settles the Qwen3 lineage question in `notes` against inheritance. "
+                "trunc-rand is -0.075 [-0.120, -0.029] at k=32, -0.169 [-0.225, "
+                "-0.120] at k=64 and -0.137 [-0.191, -0.087] at k=128, every interval "
+                "excluding zero; mrl_gain -0.29/-1.34/-3.76. In absolute terms k=32 "
+                "keeps 0.087 of a full-width 0.593. The mechanism is unexciting and "
+                "visible in the cached vectors: variance in the first 32 coordinates "
+                "is 0.025 against 0.031 for uniform (ratio 0.81), so the prefix is a "
+                "slightly *below*-average slice and random columns sample the whole "
+                "spectrum instead. No massive-activation story required."
+            ),
             notes=(
                 "Qwen3 based. Instruct-style query prompts with no matching document "
                 "prompt, so the query side is prefixed and the document side is not. "
-                "Ships no sentence_bert_config.json."
+                "Ships no sentence_bert_config.json. "
+                "LINEAGE, because it is the one place an undocumented MRL property "
+                "could have arrived from: Qwen3-Embedding-0.6B is MRL-trained (its "
+                "card's model table, 'MRL Support: Yes', defined there as support for "
+                "custom output dimensions), it is also 1024-d and Qwen3-based, and "
+                "harrier's `web_search_query` prefix is the Qwen3-Embedding query "
+                "prompt copied verbatim -- 'Instruct: Given a web search query, "
+                "retrieve relevant passages that answer the query\nQuery:' -- where "
+                "Qwen3-Embedding pairs it with an explicit empty document prompt, "
+                "which is harrier's bare document side written down. But the config "
+                "matches the *base* LLM, not the embedding model: vocab_size 151936 "
+                "and eos_token_id 151645 are Qwen/Qwen3-0.6B's, against 151669 and "
+                "151643 for Qwen/Qwen3-Embedding-0.6B (everything else -- 28 layers, "
+                "1024 hidden, 3072 intermediate, 16/8 heads, head_dim 128, rope_theta "
+                "1e6 -- is shared by all three and so distinguishes nothing). Read "
+                "that way, harrier inherited the prompt convention and the backbone "
+                "but not the contrastive stage that MRL lives in. Checked 17.09.2026 "
+                "against the three HF configs. It is an inference from metadata, not "
+                "a statement by Microsoft, which is why `mrl_probe` measures it "
+                "instead of resting on it."
             ),
         ),
     ]
