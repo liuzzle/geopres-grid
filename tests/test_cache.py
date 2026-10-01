@@ -148,6 +148,42 @@ def test_cached_backbone_encodes_misses_then_warm_starts(tmp_path, monkeypatch):
     np.testing.assert_array_equal(second, first[[1, 0]])
 
 
+def test_cached_backbone_warm_starts_after_wrapper_reload(tmp_path, monkeypatch):
+    backbone = get("mdenseon")
+    config = make_encode_config()
+    rows = [{"id": "a", "text": "alpha"}, {"id": "b", "text": "beta"}]
+    monkeypatch.setattr(
+        "geopres_grid.cache.create_dataloader",
+        lambda dataset, **kwargs: FakeInputs(dataset),
+    )
+
+    first_model = FakeModel()
+    first_wrapper = CachedBackbone(first_model, backbone, config, tmp_path)
+    first = first_wrapper.encode(
+        FakeInputs(rows),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+    first_wrapper.close()
+
+    second_model = FakeModel()
+    second_wrapper = CachedBackbone(second_model, backbone, config, tmp_path)
+    second = second_wrapper.encode(
+        FakeInputs([rows[1], rows[0]]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+
+    assert second_model.calls == 0
+    assert second_wrapper.newly_encoded == 0
+    np.testing.assert_array_equal(second, first[[1, 0]])
+    second_wrapper.close()
+
+
 def test_cached_backbone_separates_query_and_document_blocks(tmp_path, monkeypatch):
     model = FakeModel()
     backbone = get("mdenseon")
