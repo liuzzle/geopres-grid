@@ -206,6 +206,46 @@ def fake_quantize(values: np.ndarray, quantizer: Quantizer) -> np.ndarray:
     return quantizer.dequantize(quantizer.quantize(values))
 
 
+def _pairwise_cosine(values1: np.ndarray, values2: np.ndarray) -> float:
+    values1 = np.asarray(values1, dtype=np.float32)
+    values2 = np.asarray(values2, dtype=np.float32)
+    norms1 = np.linalg.norm(values1, axis=1)
+    norms2 = np.linalg.norm(values2, axis=1)
+    scores = np.sum(values1 * values2, axis=1) / np.maximum(norms1 * norms2, np.finfo(np.float32).eps)
+    return float(np.mean(scores))
+
+
+def calibration_symmetry_ablation(
+    config: PostProcConfig,
+    queries: np.ndarray,
+    documents: np.ndarray,
+) -> dict[str, float]:
+    """Compare shared and per-side calibration under both score conventions."""
+    queries = np.asarray(queries, dtype=np.float32)
+    documents = np.asarray(documents, dtype=np.float32)
+    if len(queries) != len(documents):
+        raise ValueError("queries and documents must have the same number of rows")
+
+    shared = fit_quantizer(config, np.vstack([queries, documents]))
+    query_quantizer = fit_quantizer(config, queries)
+    document_quantizer = fit_quantizer(config, documents)
+
+    shared_query = shared.quantize(queries)
+    shared_document = shared.quantize(documents)
+    side_query = query_quantizer.quantize(queries)
+    side_document = document_quantizer.quantize(documents)
+    return {
+        "shared_calibration": _pairwise_cosine(
+            shared.dequantize(shared_query), shared.dequantize(shared_document)
+        ),
+        "per_side_dequantized": _pairwise_cosine(
+            query_quantizer.dequantize(side_query),
+            document_quantizer.dequantize(side_document),
+        ),
+        "per_side_quantized": _pairwise_cosine(side_query, side_document),
+    }
+
+
 class CalibratedCompressionWrapper(CompressionWrapper):
     """MTEB-compatible wrapper using a pre-fitted project quantizer."""
 

@@ -6,6 +6,7 @@ from geopres_grid.quantizers import CalibratedCompressionWrapper
 from geopres_grid.quantizers import EqualCount
 from geopres_grid.quantizers import FP16
 from geopres_grid.quantizers import UniformAffine
+from geopres_grid.quantizers import calibration_symmetry_ablation
 from geopres_grid.quantizers import fake_quantize
 from geopres_grid.quantizers import fit_quantizer
 from geopres_grid.quantizers import quantizer_from_config
@@ -82,3 +83,19 @@ def test_calibrated_wrapper_does_not_refit_per_encode():
 
     np.testing.assert_allclose(result, [[0.5, -0.5]], atol=0.01)
     np.testing.assert_array_equal(quantizer.minimum, [-1.0, -1.0])
+
+
+def test_calibration_symmetry_ablation_reports_three_paths():
+    queries = np.array([[-1.0, -0.5], [1.0, 0.5]], dtype=np.float32)
+    documents = np.array([[-0.5, -1.0], [0.5, 1.0]], dtype=np.float32)
+
+    scores = calibration_symmetry_ablation(
+        PostProcConfig(quant_method="int4"), queries, documents
+    )
+
+    assert set(scores) == {
+        "shared_calibration",
+        "per_side_dequantized",
+        "per_side_quantized",
+    }
+    assert all(np.isfinite(score) for score in scores.values())
