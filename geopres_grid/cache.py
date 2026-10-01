@@ -12,6 +12,11 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from mteb.models.cache_wrappers.cache_wrapper import create_dataloader
+
+from geopres_grid.backbones import Backbone
+from geopres_grid.identity import EncodeConfig
+
 
 class GeoPresCache:
     """Store fp32 embeddings and a positional parquet index.
@@ -195,6 +200,134 @@ class GeoPresCache:
         if self._vectors is not None:
             self._vectors.flush()
             self._vectors = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class CachedBackbone:
+    """MTEB encoder wrapper backed by prompt-aware ``GeoPresCache`` blocks."""
+
+    def __init__(
+        self,
+        model: Any,
+        backbone: Backbone,
+        encode_config: EncodeConfig,
+        cache_root: str | Path,
+    ) -> None:
+        self._model = model
+        self.backbone = backbone
+        self.encode_config = encode_config
+        self.cache_root = Path(cache_root)
+        self._caches: dict[Path, GeoPresCache] = {}
+        self.newly_encoded = 0
+
+    @property
+    def mteb_model_meta(self) -> Any:
+        return self._model.mteb_model_meta
+
+    def similarity(self, embeddings1: Any, embeddings2: Any) -> Any:
+        return self._model.similarity(embeddings1, embeddings2)
+
+    def similarity_pairwise(self, embeddings1: Any, embeddings2: Any) -> Any:
+        return self._model.similarity_pairwise(embeddings1, embeddings2)
+
+    def _side(self, prompt_type: Any) -> str:
+        value = getattr(prompt_type, "value", prompt_type)
+        if value in (None, "query"):
+            return "query"
+        if value in ("passage", "document"):
+            return "document"
+        raise ValueError(f"Unsupported MTEB prompt_type: {prompt_type!r}")
+
+    def _cache_path(
+        self, task_name: str, hf_split: str, hf_subset: str, side: str
+    ) -> Path:
+        return (
+            self.cache_root
+            / f"{self.backbone.slug}@{self.backbone.revision}"
+            / self.encode_config.hash
+            / task_name
+            / hf_split
+            / hf_subset
+            / side
+        )
+
+    def _get_cache(self, path: Path) -> GeoPresCache:
+        if path not in self._caches:
+            cache = GeoPresCache(path, metadata=self.encode_config.to_meta())
+            cache.load()
+            self._caches[path] = cache
+        return self._caches[path]
+
+    @staticmethod
+    def _items(inputs: Any) -> list[dict[str, Any]]:
+        return [dict(item) for item in inputs.dataset]
+
+    def encode(
+        self,
+        inputs: Any,
+        *,
+        task_metadata: Any,
+        hf_split: str,
+        hf_subset: str,
+        prompt_type: Any = None,
+        batch_size: int = 32,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """Return cached vectors, encoding only prompted-text misses."""
+        side = self._side(prompt_type)
+        items = self._items(inputs)
+        raw_texts = [str(item.get("text", "")) for item in items]
+        prefix = self.backbone.prompt_for(side)
+        prompted_texts = [prefix + text for text in raw_texts]
+        cache = self._get_cache(
+            self._cache_path(task_metadata.name, hf_split, hf_subset, side)
+        )
+        cached, missing = cache.get_vectors(items, prompted_texts=prompted_texts)
+        missing_indices = np.flatnonzero(missing)
+        newly_encoded = np.empty((len(missing_indices), cache.dimension or self.backbone.native_dim), dtype=np.float32)
+        if len(missing_indices):
+            missing_items = [items[index] for index in missing_indices]
+            missing_dataset = inputs.dataset.select(missing_indices.tolist())
+            missing_inputs = create_dataloader(
+                missing_dataset,
+                task_metadata=task_metadata,
+                prompt_type=prompt_type,
+                batch_size=batch_size,
+                **kwargs,
+            )
+            encoded = self._model.encode(
+                missing_inputs,
+                task_metadata=task_metadata,
+                hf_split=hf_split,
+                hf_subset=hf_subset,
+                prompt_type=prompt_type,
+                batch_size=batch_size,
+                **kwargs,
+            )
+            if hasattr(encoded, "detach"):
+                encoded = encoded.detach().cpu().numpy()
+            newly_encoded = np.asarray(encoded, dtype=np.float32)
+            cache.add(
+                missing_items,
+                newly_encoded,
+                prompted_texts=[prompted_texts[index] for index in missing_indices],
+            )
+            cache.save()
+            self.newly_encoded += len(missing_indices)
+
+        if cached is None:
+            result = np.empty((len(items), newly_encoded.shape[1]), dtype=np.float32)
+        else:
+            result = cached.copy()
+        if len(missing_indices):
+            result[missing_indices] = newly_encoded
+        return result
+
+    def close(self) -> None:
+        for cache in self._caches.values():
+            cache.close()
 
     def __del__(self) -> None:
         self.close()

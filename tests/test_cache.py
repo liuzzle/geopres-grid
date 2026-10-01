@@ -4,6 +4,63 @@ import numpy as np
 import pytest
 
 from geopres_grid.cache import GeoPresCache
+from geopres_grid.cache import CachedBackbone
+from geopres_grid.backbones import get
+from geopres_grid.identity import EncodeConfig
+
+
+class FakeDataset:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def select(self, indices):
+        return FakeDataset([self.rows[index] for index in indices])
+
+
+class FakeInputs:
+    def __init__(self, rows):
+        self.dataset = FakeDataset(rows)
+
+
+class FakeMetadata:
+    name = "FakeRetrieval"
+
+
+class FakeModel:
+    def __init__(self):
+        self.calls = 0
+
+    @property
+    def mteb_model_meta(self):
+        return {"name": "fake"}
+
+    def encode(self, inputs, **kwargs):
+        self.calls += 1
+        return np.array(
+            [[len(row["text"]), sum(row["text"].encode())] for row in inputs.dataset],
+            dtype=np.float32,
+        )
+
+    def similarity(self, embeddings1, embeddings2):
+        return np.asarray(embeddings1) @ np.asarray(embeddings2).T
+
+    def similarity_pairwise(self, embeddings1, embeddings2):
+        return np.sum(np.asarray(embeddings1) * np.asarray(embeddings2), axis=1)
+
+
+def make_encode_config():
+    return EncodeConfig(
+        model_id="fake/model",
+        revision="a" * 40,
+        max_seq_length=512,
+        dtype="float32",
+        prompts=(("query", "query: "), ("document", "document: ")),
+        sentence_transformers_version="5.7",
+        transformers_version="4.56",
+    )
 
 
 def test_round_trip_preserves_order_and_metadata(tmp_path):
@@ -58,3 +115,68 @@ def test_conflicting_duplicate_is_rejected(tmp_path):
     cache.add([item], np.array([[1, 2]], dtype=np.float32))
     with pytest.raises(ValueError, match="conflicting vector"):
         cache.add([item], np.array([[9, 9]], dtype=np.float32))
+
+
+def test_cached_backbone_encodes_misses_then_warm_starts(tmp_path, monkeypatch):
+    model = FakeModel()
+    backbone = get("mdenseon")
+    wrapper = CachedBackbone(model, backbone, make_encode_config(), tmp_path)
+    rows = [{"id": "a", "text": "alpha"}, {"id": "b", "text": "beta"}]
+
+    monkeypatch.setattr(
+        "geopres_grid.cache.create_dataloader",
+        lambda dataset, **kwargs: FakeInputs(dataset),
+    )
+    first = wrapper.encode(
+        FakeInputs(rows),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+    assert model.calls == 1
+    assert wrapper.newly_encoded == 2
+
+    second = wrapper.encode(
+        FakeInputs([rows[1], rows[0]]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+    assert model.calls == 1
+    np.testing.assert_array_equal(second, first[[1, 0]])
+
+
+def test_cached_backbone_separates_query_and_document_blocks(tmp_path, monkeypatch):
+    model = FakeModel()
+    backbone = get("mdenseon")
+    wrapper = CachedBackbone(model, backbone, make_encode_config(), tmp_path)
+    row = {"id": "same", "text": "same"}
+    monkeypatch.setattr(
+        "geopres_grid.cache.create_dataloader",
+        lambda dataset, **kwargs: FakeInputs(dataset),
+    )
+
+    wrapper.encode(
+        FakeInputs([row]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+    wrapper.encode(
+        FakeInputs([row]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="passage",
+    )
+
+    assert model.calls == 2
+    query_path = wrapper._cache_path("FakeRetrieval", "test", "default", "query")
+    document_path = wrapper._cache_path(
+        "FakeRetrieval", "test", "default", "document"
+    )
+    assert (query_path / "ids.parquet").exists()
+    assert (document_path / "ids.parquet").exists()
