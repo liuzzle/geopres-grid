@@ -14,12 +14,14 @@ from geopres_grid.backbones import get, require_runnable
 from geopres_grid.cache import CachedBackbone
 from geopres_grid.config import EMBEDDING_CACHE_PATH, resolve_device
 from geopres_grid.identity import EncodeConfig
+from geopres_grid.evaluation import task_names
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backbone", default="mdenseon")
-    parser.add_argument("--task", default="NanoSciFactRetrieval")
+    parser.add_argument("--task", action="append", help="Explicit task; repeat to evaluate multiple tasks")
+    parser.add_argument("--tier", choices=["tier0", "tier1", "tier2"], default="tier0")
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--cache-root", default=str(EMBEDDING_CACHE_PATH))
@@ -48,9 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     wrapped = CachedBackbone(model, backbone, encode_config, Path(args.cache_root))
 
-    task = mteb.get_tasks(tasks=[args.task])[0]
-    task.load_data()
-    result = mteb.evaluate(wrapped, tasks=[task], eval_splits=[args.split])
+    selected_tasks = tuple(args.task) if args.task else task_names(args.tier)
+    tasks = mteb.get_tasks(tasks=list(selected_tasks))
+    for task in tasks:
+        task.load_data()
+    result = mteb.evaluate(wrapped, tasks=tasks, eval_splits=[args.split])
     print(result)
     return 0
 
