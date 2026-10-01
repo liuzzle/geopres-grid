@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
+from mteb.models import CompressionWrapper
 
 from geopres_grid.identity import PostProcConfig
 
@@ -191,3 +192,29 @@ def quantizer_from_config(config: PostProcConfig) -> Quantizer:
         return methods[config.quant_method]()
     except KeyError as error:
         raise ValueError(f"Unsupported quant_method: {config.quant_method}") from error
+
+
+def fit_quantizer(config: PostProcConfig, calibration: np.ndarray) -> Quantizer:
+    """Fit one calibration table for all vectors that share a post-processing run."""
+    quantizer = quantizer_from_config(config)
+    quantizer.fit(calibration)
+    return quantizer
+
+
+def fake_quantize(values: np.ndarray, quantizer: Quantizer) -> np.ndarray:
+    """Quantize and immediately restore fp32 values for cosine evaluation."""
+    return quantizer.dequantize(quantizer.quantize(values))
+
+
+class CalibratedCompressionWrapper(CompressionWrapper):
+    """MTEB-compatible wrapper using a pre-fitted project quantizer."""
+
+    def __init__(self, model: object, quantizer: Quantizer) -> None:
+        self.model = model
+        self.quantizer = quantizer
+
+    def encode(self, inputs: object, **kwargs: object) -> np.ndarray:
+        embeddings = self.model.encode(inputs, **kwargs)
+        if hasattr(embeddings, "detach"):
+            embeddings = embeddings.detach().cpu().numpy()
+        return fake_quantize(np.asarray(embeddings, dtype=np.float32), self.quantizer)

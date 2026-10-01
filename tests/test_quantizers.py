@@ -2,9 +2,12 @@ import numpy as np
 
 from geopres_grid.identity import PostProcConfig
 from geopres_grid.quantizers import Binary
+from geopres_grid.quantizers import CalibratedCompressionWrapper
 from geopres_grid.quantizers import EqualCount
 from geopres_grid.quantizers import FP16
 from geopres_grid.quantizers import UniformAffine
+from geopres_grid.quantizers import fake_quantize
+from geopres_grid.quantizers import fit_quantizer
 from geopres_grid.quantizers import quantizer_from_config
 
 
@@ -48,3 +51,34 @@ def test_binary_fp16_and_config_factory():
     assert fp16.dequantize(fp16.quantize(values)).dtype == np.float32
 
     assert type(quantizer_from_config(PostProcConfig(quant_method="int8"))) is UniformAffine
+
+
+def test_fit_quantizer_and_fake_path_reuse_shared_calibration():
+    calibration = np.array([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32)
+    quantizer = fit_quantizer(PostProcConfig(quant_method="int8"), calibration)
+    query = np.array([[0.25, -0.25]], dtype=np.float32)
+    document = np.array([[-0.25, 0.25]], dtype=np.float32)
+
+    query_restored = fake_quantize(query, quantizer)
+    document_restored = fake_quantize(document, quantizer)
+
+    assert np.allclose(query_restored, query, atol=0.01)
+    assert np.allclose(document_restored, document, atol=0.01)
+
+
+class FakeModel:
+    mteb_model_meta = None
+
+    def encode(self, inputs, **kwargs):
+        return np.asarray(inputs, dtype=np.float32)
+
+
+def test_calibrated_wrapper_does_not_refit_per_encode():
+    quantizer = UniformAffine(8)
+    quantizer.fit(np.array([[-1.0, -1.0], [1.0, 1.0]], dtype=np.float32))
+    wrapper = CalibratedCompressionWrapper(FakeModel(), quantizer)
+
+    result = wrapper.encode(np.array([[0.5, -0.5]], dtype=np.float32))
+
+    np.testing.assert_allclose(result, [[0.5, -0.5]], atol=0.01)
+    np.testing.assert_array_equal(quantizer.minimum, [-1.0, -1.0])
