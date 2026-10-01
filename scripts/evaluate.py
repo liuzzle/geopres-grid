@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     tasks = mteb.get_tasks(tasks=list(selected_tasks))
     for task in tasks:
         task.load_data()
-    result = mteb.evaluate(wrapped, tasks=tasks, eval_splits=[args.split])
+    result = mteb.evaluate(wrapped, tasks=tasks)
     print(result)
     return 0
 

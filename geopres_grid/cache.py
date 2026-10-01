@@ -224,7 +224,16 @@ class CachedBackbone:
 
     @property
     def mteb_model_meta(self) -> Any:
-        return self._model.mteb_model_meta
+        metadata = getattr(self._model, "mteb_model_meta", None)
+        if metadata is not None:
+            return metadata
+        from mteb.models.model_meta import ModelMeta
+
+        return ModelMeta.create_empty()
+
+    def load_model(self) -> "CachedBackbone":
+        """Satisfy MTEB's model lifecycle without loading a second model."""
+        return self
 
     def similarity(self, embeddings1: Any, embeddings2: Any) -> Any:
         return self._model.similarity(embeddings1, embeddings2)
@@ -299,10 +308,6 @@ class CachedBackbone:
             )
             encoded = self._model.encode(
                 missing_inputs,
-                task_metadata=task_metadata,
-                hf_split=hf_split,
-                hf_subset=hf_subset,
-                prompt_type=prompt_type,
                 batch_size=batch_size,
                 **kwargs,
             )

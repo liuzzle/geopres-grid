@@ -148,6 +148,49 @@ def test_cached_backbone_encodes_misses_then_warm_starts(tmp_path, monkeypatch):
     np.testing.assert_array_equal(second, first[[1, 0]])
 
 
+def test_cached_backbone_load_model_is_noop(tmp_path):
+    wrapper = CachedBackbone(FakeModel(), get("mdenseon"), make_encode_config(), tmp_path)
+
+    assert wrapper.load_model() is wrapper
+
+
+def test_cached_backbone_provides_metadata_when_model_has_none(tmp_path):
+    class ModelWithoutMetadata(FakeModel):
+        @property
+        def mteb_model_meta(self):
+            raise AttributeError("metadata is not defined")
+
+    wrapper = CachedBackbone(
+        ModelWithoutMetadata(), get("mdenseon"), make_encode_config(), tmp_path
+    )
+
+    assert wrapper.mteb_model_meta is not None
+
+
+def test_cached_backbone_does_not_forward_mteb_only_encode_keywords(tmp_path, monkeypatch):
+    class StrictModel(FakeModel):
+        def encode(self, inputs, *, batch_size=32):
+            return super().encode(inputs, batch_size=batch_size)
+
+    monkeypatch.setattr(
+        "geopres_grid.cache.create_dataloader",
+        lambda dataset, **kwargs: FakeInputs(dataset),
+    )
+    wrapper = CachedBackbone(
+        StrictModel(), get("mdenseon"), make_encode_config(), tmp_path
+    )
+
+    result = wrapper.encode(
+        FakeInputs([{"id": "a", "text": "alpha"}]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="query",
+    )
+
+    assert result.shape == (1, 2)
+
+
 def test_cached_backbone_warm_starts_after_wrapper_reload(tmp_path, monkeypatch):
     backbone = get("mdenseon")
     config = make_encode_config()

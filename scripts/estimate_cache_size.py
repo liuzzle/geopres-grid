@@ -21,14 +21,15 @@ def _split_rows(collection: Any, split: str) -> int:
     return len(values)
 
 
-def estimate_task(task: Any, backbone: Any, split: str = "test", itemsize: int = 4) -> dict[str, Any]:
+def estimate_task(task: Any, backbone: Any, split: str | None = None, itemsize: int = 4) -> dict[str, Any]:
     """Return document/query row counts and fp32 byte estimates for one task."""
+    split = split or task.metadata.eval_splits[0]
     documents = _split_rows(getattr(task, "corpus", None), split)
     queries = _split_rows(getattr(task, "queries", None), split)
     document_bytes = documents * backbone.native_dim * itemsize
     query_bytes = queries * backbone.native_dim * itemsize
     return {
-        "task": task.name,
+        "task": getattr(task, "name", None) or task.metadata.name,
         "split": split,
         "backbone": backbone.key,
         "dimension": backbone.native_dim,
@@ -45,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", action="append", required=True, help="MTEB task name; repeat for multiple tasks")
     parser.add_argument("--backbone", action="append", help="Backbone key; defaults to all registry entries")
-    parser.add_argument("--split", default="test")
+    parser.add_argument("--split", default=None, help="Split override; defaults to each task's first eval split")
     parser.add_argument("--itemsize", type=int, default=4, help="Bytes per scalar; 4 is fp32")
     return parser
 
