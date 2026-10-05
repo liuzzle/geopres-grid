@@ -52,3 +52,26 @@ documented-MRL models run through the identical measurement as controls. On LFM2
 truncation is indistinguishable from random columns; on **both harriers it is worse than
 random columns**, so it is not a naive baseline there but below one. See
 `docs/README-draft.md`.
+
+
+### Evaluating a grid cell
+
+```bash
+uv run python scripts/precompute.py --backbone lfm25 --tier tier1        # GPU: fill the cache
+uv run python scripts/evaluate.py --backbone lfm25 --task NanoArguAnaRetrieval \
+    --dr-method pca_ror --target-dim 128 --quant-method equal_count_4    # CPU: one cell
+uv run python scripts/symmetry_ablation.py --backbone lfm25 --task NanoArguAnaRetrieval
+```
+
+Per task, `evaluate.py` runs a warm-up pass (the backbone's fp32 baseline), fits PCA
+and the quantization table once on up to 10,000 of that task's cached embeddings, and
+then scores the cell -- the calibration protocol of Kisako et al. (arXiv:2606.01074,
+§3.5), including its stated limitation that it is transductive. Results are stored
+per run id under `$EVALUATION_RESULTS_PATH`.
+
+Quantizers follow Kisako et al.'s bit grid (b ∈ {1, 2, 4, 8, 16, 32}): `binary` is
+sign quantization, `equal_count_{2,4,8}` their global equal-count lookup table,
+`fp16` a float16 round trip, `none` the fp32 original. `int*`/`uint*` are uniform
+affine with one range per dimension, the comparison point. The distinction matters:
+the variance imbalance that PCA+ROR removes costs most under a shared grid
+(`equal_count_*`, `binary`).

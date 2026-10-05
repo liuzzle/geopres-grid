@@ -97,3 +97,21 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   on the basis of silent cards; both are MRL-trained per their papers. Every backbone
   now carries `mrl_checked` plus a source for the claim in either direction, and
   `tests/test_backbones.py` fails if any model is left in the unchecked state.
+- **MTEB's result cache is keyed by `ModelMeta` name and revision only**, and its
+  default `overwrite_strategy="only-missing"` skips any task whose result file
+  exists. A wrapper with an empty `ModelMeta` shares one slot with every other such
+  wrapper, so a second backbone or a post-processed run silently returns the first
+  run's scores. Every wrapper returns `cache.run_model_meta(...)`: the encode hash
+  for `CachedBackbone`, the run id for `PostProcessedBackbone`.
+- **MTEB rewrites the text before `encode`.** Documents become
+  `(title + " " + text).strip()`; queries get any instruction appended. Cache keys
+  hash that prepared text, so precompute goes through MTEB's own `create_dataloader`,
+  and misses are encoded from the prepared text -- never re-prepared, which doubles
+  the title. `SentenceTransformer.encode` does not accept MTEB's `DataLoader`; misses
+  go in as strings with the registry prefix as `prompt=` (`""`, not `None`, on a bare
+  side, or a `default_prompt_name` would apply).
+- **Whether a quantizer shares one grid across coordinates decides how much PCA+ROR
+  matters.** `EqualCount` (Kisako et al. §3.4: one global table) and `Binary` share
+  one; `UniformAffine` fits a range per dimension and absorbs most of PCA's variance
+  imbalance itself. Do not make `EqualCount` per-dimension "for consistency" -- the
+  global table is the published method.
