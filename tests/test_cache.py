@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 import numpy as np
@@ -30,17 +31,20 @@ class FakeMetadata:
 
 
 class FakeModel:
+    """Stands in for `SentenceTransformer.encode`: a list of texts plus `prompt`."""
+
     def __init__(self):
         self.calls = 0
+        self.seen = []
+        self.prompts = []
 
-    @property
-    def mteb_model_meta(self):
-        return {"name": "fake"}
-
-    def encode(self, inputs, **kwargs):
+    def encode(self, texts, *, prompt=None, batch_size=32, **kwargs):
         self.calls += 1
+        self.prompts.append(prompt)
+        texts = [(prompt or "") + text for text in texts]
+        self.seen.extend(texts)
         return np.array(
-            [[len(row["text"]), sum(row["text"].encode())] for row in inputs.dataset],
+            [[len(text), sum(text.encode())] for text in texts],
             dtype=np.float32,
         )
 
@@ -123,10 +127,6 @@ def test_cached_backbone_encodes_misses_then_warm_starts(tmp_path, monkeypatch):
     wrapper = CachedBackbone(model, backbone, make_encode_config(), tmp_path)
     rows = [{"id": "a", "text": "alpha"}, {"id": "b", "text": "beta"}]
 
-    monkeypatch.setattr(
-        "geopres_grid.cache.create_dataloader",
-        lambda dataset, **kwargs: FakeInputs(dataset),
-    )
     first = wrapper.encode(
         FakeInputs(rows),
         task_metadata=FakeMetadata(),
@@ -169,13 +169,9 @@ def test_cached_backbone_provides_metadata_when_model_has_none(tmp_path):
 
 def test_cached_backbone_does_not_forward_mteb_only_encode_keywords(tmp_path, monkeypatch):
     class StrictModel(FakeModel):
-        def encode(self, inputs, *, batch_size=32):
-            return super().encode(inputs, batch_size=batch_size)
+        def encode(self, texts, *, prompt, batch_size, convert_to_numpy, show_progress_bar):
+            return super().encode(texts, prompt=prompt, batch_size=batch_size)
 
-    monkeypatch.setattr(
-        "geopres_grid.cache.create_dataloader",
-        lambda dataset, **kwargs: FakeInputs(dataset),
-    )
     wrapper = CachedBackbone(
         StrictModel(), get("mdenseon"), make_encode_config(), tmp_path
     )
@@ -186,6 +182,7 @@ def test_cached_backbone_does_not_forward_mteb_only_encode_keywords(tmp_path, mo
         hf_split="test",
         hf_subset="default",
         prompt_type="query",
+        num_proc=1,
     )
 
     assert result.shape == (1, 2)
@@ -195,10 +192,6 @@ def test_cached_backbone_warm_starts_after_wrapper_reload(tmp_path, monkeypatch)
     backbone = get("mdenseon")
     config = make_encode_config()
     rows = [{"id": "a", "text": "alpha"}, {"id": "b", "text": "beta"}]
-    monkeypatch.setattr(
-        "geopres_grid.cache.create_dataloader",
-        lambda dataset, **kwargs: FakeInputs(dataset),
-    )
 
     first_model = FakeModel()
     first_wrapper = CachedBackbone(first_model, backbone, config, tmp_path)
@@ -232,10 +225,6 @@ def test_cached_backbone_separates_query_and_document_blocks(tmp_path, monkeypat
     backbone = get("mdenseon")
     wrapper = CachedBackbone(model, backbone, make_encode_config(), tmp_path)
     row = {"id": "same", "text": "same"}
-    monkeypatch.setattr(
-        "geopres_grid.cache.create_dataloader",
-        lambda dataset, **kwargs: FakeInputs(dataset),
-    )
 
     wrapper.encode(
         FakeInputs([row]),
@@ -259,3 +248,50 @@ def test_cached_backbone_separates_query_and_document_blocks(tmp_path, monkeypat
     )
     assert (query_path / "ids.parquet").exists()
     assert (document_path / "ids.parquet").exists()
+
+def test_cached_backbone_encodes_the_prepared_text_under_its_own_key(tmp_path):
+    model = FakeModel()
+    backbone = get("mdenseon")
+    wrapper = CachedBackbone(model, backbone, make_encode_config(), tmp_path)
+    # MTEB has already prepared the row: title and body joined into `text`.
+    prepared = {"id": "d1", "text": "Cats Cats purr.", "body": "Cats purr.", "title": "Cats"}
+
+    wrapper.encode(
+        FakeInputs([prepared]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="document",
+    )
+
+    assert model.seen == ["document: Cats Cats purr."]
+    cache = GeoPresCache(wrapper._cache_path("FakeRetrieval", "test", "default", "document"))
+    cache.load()
+    _, missing = cache.get_vectors([prepared], prompted_texts=model.seen)
+    assert not missing.any()
+
+
+def test_cached_backbone_passes_an_empty_prompt_on_a_bare_side(tmp_path):
+    model = FakeModel()
+    wrapper = CachedBackbone(model, get("harrier-270m"), make_encode_config(), tmp_path)
+
+    wrapper.encode(
+        FakeInputs([{"id": "d1", "text": "body"}]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type="document",
+    )
+
+    # `prompt=""`, not None: None would let a default_prompt_name apply.
+    assert model.prompts == [""]
+
+
+def test_run_model_meta_gives_each_encode_config_its_own_result_slot(tmp_path):
+    other = dataclasses.replace(make_encode_config(), max_seq_length=256)
+    first = CachedBackbone(FakeModel(), get("mdenseon"), make_encode_config(), tmp_path)
+    second = CachedBackbone(FakeModel(), get("mdenseon"), other, tmp_path)
+
+    assert first.mteb_model_meta.name == "geopres-grid/mdenseon"
+    assert first.mteb_model_meta.revision == make_encode_config().hash
+    assert first.mteb_model_meta.revision != second.mteb_model_meta.revision

@@ -1,8 +1,27 @@
-"""Version-pinned evaluation task tiers."""
+"""Version-pinned evaluation task tiers, and the evaluation path for one grid cell.
+
+A grid cell is `RunId(encode, postproc)`. `PostProcessedBackbone` serves it to
+MTEB: cached fp32 vectors -> normalize -> reduce -> normalize -> fake
+quantization, with every fitted part fitted once per task before scoring, on that
+task's own inputs -- the calibration protocol of Kisako, Tsukagoshi & Sasano
+(arXiv:2606.01074, §3.5). The protocol is transductive; their Limitations section
+says it "may overestimate performance" against fitting once on a separate
+calibration corpus, and the write-up should carry the same caveat.
+"""
 
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+
+from geopres_grid.cache import CachedBackbone, run_model_meta, side_of
+from geopres_grid.identity import PostProcConfig, RunId
+from geopres_grid.precompute import leaf_tasks
+from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
+from geopres_grid.reducers import PostProcessingPipeline
 
 Tier = Literal["tier0", "tier1", "tier2"]
 
@@ -13,7 +32,7 @@ NANOBEIR_TASKS: tuple[str, ...] = (
     "NanoFEVERRetrieval",
     "NanoFiQA2018Retrieval",
     "NanoHotpotQARetrieval",
-    "NanoMSMARCOREtrieval",
+    "NanoMSMARCORetrieval",
     "NanoNFCorpusRetrieval",
     "NanoNQRetrieval",
     "NanoQuoraRetrieval",
@@ -21,21 +40,235 @@ NANOBEIR_TASKS: tuple[str, ...] = (
     "NanoSciFactRetrieval",
     "NanoTouche2020Retrieval",
 )
+"""`mteb.get_benchmark("NanoBEIR")` in mteb 2.15.1. Their only split is `train`."""
+
+BEIR_TASKS: tuple[str, ...] = (
+    "TRECCOVID",
+    "NFCorpus",
+    "NQ",
+    "HotpotQA",
+    "FiQA2018",
+    "ArguAna",
+    "Touche2020",
+    "CQADupstackRetrieval",
+    "QuoraRetrieval",
+    "DBPedia",
+    "SCIDOCS",
+    "FEVER",
+    "ClimateFEVER",
+    "SciFact",
+    "MSMARCO",
+)
+"""`mteb.get_benchmark("BEIR")` in mteb 2.15.1: the fifteen public BEIR datasets
+(Thakur et al., arXiv:2104.08663). Meeting 16.09 §4 replaced Konstantinos' six,
+a strict and mostly expensive subset, with these. MSMARCO is scored on its
+declared `dev` split; nothing here overrides `eval_splits`."""
 
 TIER_TASKS: dict[Tier, tuple[str, ...]] = {
     "tier0": ("NanoArguAnaRetrieval", "STSBenchmark"),
     "tier1": NANOBEIR_TASKS,
-    "tier2": (
-        "ArguAna",
-        "QuoraRetrieval",
-        "HotpotQA",
-        "NQ",
-        "MSMARCO",
-        "DBPedia",
-    ),
+    "tier2": BEIR_TASKS,
 }
 
 
 def task_names(tier: Tier) -> tuple[str, ...]:
     """Return the immutable task list for one evaluation tier."""
     return TIER_TASKS[tier]
+
+
+# --- calibration ---------------------------------------------------------------
+
+CALIBRATION_MAX_ROWS = 10_000
+"""Kisako et al. §3.5 fit PCA on up to 10,000 embeddings sampled from the task's
+warm-up cache, or on all of them when there are fewer. The same sample feeds the
+quantization tables, which they fit on the reduced calibration embeddings."""
+
+CALIBRATION_SEED = 0
+
+
+def cached_blocks(
+    task_directory: Path,
+    *,
+    splits: list[str] | None = None,
+    subsets: list[str] | None = None,
+) -> dict[str, list[np.ndarray]]:
+    """Memory-mapped cache blocks of one task (`CachedBackbone.task_directory`), by side.
+
+    Raises when the task has no cached vectors: calibration must come from a
+    finished warm-up pass, never from whatever happened to be cached so far.
+    """
+    blocks: dict[str, list[np.ndarray]] = {"query": [], "document": []}
+    for path in sorted(Path(task_directory).glob("*/*/*/embeddings.npy")):
+        side_dir = path.parent
+        subset, split = side_dir.parent.name, side_dir.parent.parent.name
+        if splits and split not in splits:
+            continue
+        if subsets and subset not in subsets:
+            continue
+        blocks[side_dir.name].append(np.load(path, mmap_mode="r"))
+    if not any(blocks.values()):
+        raise FileNotFoundError(
+            f"No cached embeddings under {task_directory}; "
+            "run the warm-up pass (or scripts/precompute.py) first"
+        )
+    return blocks
+
+
+def sample_rows(blocks: list[np.ndarray], max_rows: int, seed: int) -> np.ndarray:
+    """Uniform sample without replacement over the rows of several blocks.
+
+    Gathers per block with sorted indices, so a memory-mapped corpus is never
+    concatenated into RAM.
+    """
+    sizes = [len(block) for block in blocks]
+    total = sum(sizes)
+    if total == 0:
+        raise ValueError("cannot sample calibration rows from empty blocks")
+    if total <= max_rows:
+        chosen = np.arange(total)
+    else:
+        chosen = np.sort(np.random.default_rng(seed).choice(total, max_rows, replace=False))
+    offsets = np.concatenate(([0], np.cumsum(sizes)))
+    parts = []
+    for block, start, stop in zip(blocks, offsets[:-1], offsets[1:]):
+        local = chosen[(chosen >= start) & (chosen < stop)] - start
+        if len(local):
+            parts.append(np.asarray(block[local], dtype=np.float32))
+    return np.vstack(parts)
+
+
+# --- one grid cell ----------------------------------------------------------------
+
+
+@dataclass
+class FittedTask:
+    """Everything fitted for one task: the shared DR pipeline and a table per side."""
+
+    pipeline: PostProcessingPipeline
+    quantizers: dict[str, Quantizer]
+
+
+class PostProcessedBackbone:
+    """MTEB encoder for one grid cell, reading through a `CachedBackbone`.
+
+    DR is fitted on both sides together and always shared -- a projection that
+    differed between queries and documents would not put them in one space. The
+    quantization table is shared too (meeting 26.08, Kisako et al. §3.5) unless
+    `quant_symmetric=False`, which fits one table per side for the symmetry
+    ablation. Nothing is refitted inside `encode`.
+    """
+
+    def __init__(
+        self,
+        cached: CachedBackbone,
+        config: PostProcConfig,
+        *,
+        geopres_weights: np.ndarray | None = None,
+    ) -> None:
+        self.cached = cached
+        self.config = config
+        self.geopres_weights = geopres_weights
+        self.fitted: dict[str, FittedTask] = {}
+
+    @property
+    def run_id(self) -> RunId:
+        return RunId(self.cached.encode_config, self.config)
+
+    @property
+    def mteb_model_meta(self) -> Any:
+        """Results are stored under the run id, one slot per grid cell."""
+        return run_model_meta(self.cached.backbone, self.run_id.value)
+
+    def load_model(self) -> "PostProcessedBackbone":
+        return self
+
+    def similarity(self, embeddings1: Any, embeddings2: Any) -> Any:
+        return self.cached.similarity(embeddings1, embeddings2)
+
+    def similarity_pairwise(self, embeddings1: Any, embeddings2: Any) -> Any:
+        return self.cached.similarity_pairwise(embeddings1, embeddings2)
+
+    def fit_task(
+        self,
+        task_name: str,
+        blocks: dict[str, list[np.ndarray]],
+        *,
+        max_rows: int = CALIBRATION_MAX_ROWS,
+        seed: int = CALIBRATION_SEED,
+    ) -> FittedTask:
+        """Fit DR and quantization for one task from its cached blocks."""
+        both = sample_rows(blocks["query"] + blocks["document"], max_rows, seed)
+        pipeline = PostProcessingPipeline(
+            self.config, both.shape[1], geopres_weights=self.geopres_weights
+        )
+        pipeline.fit(both)
+        if self.config.quant_symmetric:
+            shared = fit_quantizer(self.config, pipeline.transform(both))
+            quantizers = {"query": shared, "document": shared}
+        else:
+            quantizers = {
+                side: fit_quantizer(
+                    self.config, pipeline.transform(sample_rows(rows, max_rows, seed))
+                )
+                for side, rows in blocks.items()
+                if rows
+            }
+        fitted = FittedTask(pipeline, quantizers)
+        self.fitted[task_name] = fitted
+        return fitted
+
+    def encode(
+        self,
+        inputs: Any,
+        *,
+        task_metadata: Any,
+        hf_split: str,
+        hf_subset: str,
+        prompt_type: Any = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        fitted = self.fitted.get(task_metadata.name)
+        if fitted is None:
+            raise RuntimeError(
+                f"{task_metadata.name} has no fitted post-processing; call fit_task first"
+            )
+        values = self.cached.encode(
+            inputs,
+            task_metadata=task_metadata,
+            hf_split=hf_split,
+            hf_subset=hf_subset,
+            prompt_type=prompt_type,
+            **kwargs,
+        )
+        quantizer = fitted.quantizers[side_of(prompt_type)]
+        return fake_quantize(fitted.pipeline.transform(values), quantizer)
+
+
+def evaluate_cell(
+    cell: PostProcessedBackbone,
+    task: Any,
+    *,
+    results_cache: Any = None,
+    encode_kwargs: dict[str, Any] | None = None,
+) -> tuple[Any, Any]:
+    """Warm up, calibrate and score one task for one grid cell.
+
+    1. Warm-up pass through the plain cache wrapper. It fills the embedding cache
+       and is the fp32 baseline of this backbone, stored under the encode hash.
+    2. Fit on each leaf task's cached inputs (Kisako et al. §3.5).
+    3. Score the cell, stored under the run id.
+    Returns the two `ModelResult`s, warm-up first.
+    """
+    import mteb
+
+    kwargs = {"cache": results_cache} if results_cache is not None else {}
+    baseline = mteb.evaluate(cell.cached, task, encode_kwargs=encode_kwargs, **kwargs)
+    for leaf in leaf_tasks(task):
+        blocks = cached_blocks(
+            cell.cached.task_directory(leaf.metadata.name),
+            splits=list(leaf.eval_splits),
+            subsets=list(leaf.hf_subsets),
+        )
+        cell.fit_task(leaf.metadata.name, blocks)
+    scored = mteb.evaluate(cell, task, encode_kwargs=encode_kwargs, **kwargs)
+    return baseline, scored

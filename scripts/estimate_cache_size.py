@@ -21,11 +21,33 @@ def _split_rows(collection: Any, split: str) -> int:
     return len(values)
 
 
+def _dataset_rows(task: Any, split: str, side: str) -> int | None:
+    """Rows of `side` in MTEB's v2 layout, `task.dataset[subset][split][side]`.
+
+    Standard retrieval tasks (all of full BEIR) load only into this layout and
+    have no `task.corpus`; reading `corpus` alone would report 0 bytes for them.
+    Returns None when the task is not in the v2 layout.
+    """
+    dataset = getattr(task, "dataset", None)
+    if not isinstance(dataset, dict):
+        return None
+    counts = [
+        len(subset[split][side])
+        for subset in dataset.values()
+        if isinstance(subset, dict) and split in subset and side in subset[split]
+    ]
+    return sum(counts) if counts else None
+
+
 def estimate_task(task: Any, backbone: Any, split: str | None = None, itemsize: int = 4) -> dict[str, Any]:
     """Return document/query row counts and fp32 byte estimates for one task."""
     split = split or task.metadata.eval_splits[0]
-    documents = _split_rows(getattr(task, "corpus", None), split)
-    queries = _split_rows(getattr(task, "queries", None), split)
+    documents = _dataset_rows(task, split, "corpus")
+    if documents is None:
+        documents = _split_rows(getattr(task, "corpus", None), split)
+    queries = _dataset_rows(task, split, "queries")
+    if queries is None:
+        queries = _split_rows(getattr(task, "queries", None), split)
     document_bytes = documents * backbone.native_dim * itemsize
     query_bytes = queries * backbone.native_dim * itemsize
     return {
@@ -58,7 +80,9 @@ def main(argv: list[str] | None = None) -> int:
 
     import mteb
 
-    tasks = mteb.get_tasks(tasks=args.task)
+    from geopres_grid.precompute import leaf_tasks
+
+    tasks = [leaf for task in mteb.get_tasks(tasks=args.task) for leaf in leaf_tasks(task)]
     for task in tasks:
         task.load_data()
     backbones = [get(key) for key in args.backbone] if args.backbone else all_backbones()

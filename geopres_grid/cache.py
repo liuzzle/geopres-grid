@@ -12,8 +12,6 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
-from mteb.models.cache_wrappers.cache_wrapper import create_dataloader
-
 from geopres_grid.backbones import Backbone
 from geopres_grid.identity import EncodeConfig
 
@@ -205,8 +203,26 @@ class GeoPresCache:
         self.close()
 
 
+def side_of(prompt_type: Any) -> str:
+    """Cache side for an MTEB `prompt_type`; tasks without one (STS) are queries."""
+    value = getattr(prompt_type, "value", prompt_type)
+    if value in (None, "query"):
+        return "query"
+    if value in ("passage", "document"):
+        return "document"
+    raise ValueError(f"Unsupported MTEB prompt_type: {prompt_type!r}")
+
+
 class CachedBackbone:
-    """MTEB encoder wrapper backed by prompt-aware ``GeoPresCache`` blocks."""
+    """MTEB encoder wrapper backed by prompt-aware ``GeoPresCache`` blocks.
+
+    ``inputs`` arrive already prepared by MTEB (documents as ``title + " " +
+    text``, stripped). Misses are encoded from exactly that text with the
+    registry's literal prefix passed as ``prompt``, so the string the model sees
+    is byte-identical to the one the cache key hashes. ``prompt=""`` on a bare
+    side also suppresses a model's ``default_prompt_name``, which
+    ``prompt_name=None`` would not (sentence-transformers ``_resolve_prompt``).
+    """
 
     def __init__(
         self,
@@ -224,12 +240,14 @@ class CachedBackbone:
 
     @property
     def mteb_model_meta(self) -> Any:
-        metadata = getattr(self._model, "mteb_model_meta", None)
-        if metadata is not None:
-            return metadata
-        from mteb.models.model_meta import ModelMeta
+        """Name and revision under which MTEB stores this wrapper's results.
 
-        return ModelMeta.create_empty()
+        MTEB's result cache is keyed by `ModelMeta` name and revision only, and
+        skips a task whose result already exists there. An empty meta gives every
+        run the same slot, so a second backbone or a post-processed run would
+        silently return the first run's scores. The revision is the encode hash.
+        """
+        return run_model_meta(self.backbone, self.encode_config.hash)
 
     def load_model(self) -> "CachedBackbone":
         """Satisfy MTEB's model lifecycle without loading a second model."""
@@ -242,25 +260,21 @@ class CachedBackbone:
         return self._model.similarity_pairwise(embeddings1, embeddings2)
 
     def _side(self, prompt_type: Any) -> str:
-        value = getattr(prompt_type, "value", prompt_type)
-        if value in (None, "query"):
-            return "query"
-        if value in ("passage", "document"):
-            return "document"
-        raise ValueError(f"Unsupported MTEB prompt_type: {prompt_type!r}")
+        return side_of(prompt_type)
 
-    def _cache_path(
-        self, task_name: str, hf_split: str, hf_subset: str, side: str
-    ) -> Path:
+    def task_directory(self, task_name: str) -> Path:
+        """Root of every cached block for one task: `{split}/{subset}/{side}` below."""
         return (
             self.cache_root
             / f"{self.backbone.slug}@{self.backbone.revision}"
             / self.encode_config.hash
             / task_name
-            / hf_split
-            / hf_subset
-            / side
         )
+
+    def _cache_path(
+        self, task_name: str, hf_split: str, hf_subset: str, side: str
+    ) -> Path:
+        return self.task_directory(task_name) / hf_split / hf_subset / side
 
     def _get_cache(self, path: Path) -> GeoPresCache:
         if path not in self._caches:
@@ -298,18 +312,12 @@ class CachedBackbone:
         newly_encoded = np.empty((len(missing_indices), cache.dimension or self.backbone.native_dim), dtype=np.float32)
         if len(missing_indices):
             missing_items = [items[index] for index in missing_indices]
-            missing_dataset = inputs.dataset.select(missing_indices.tolist())
-            missing_inputs = create_dataloader(
-                missing_dataset,
-                task_metadata=task_metadata,
-                prompt_type=prompt_type,
-                batch_size=batch_size,
-                **kwargs,
-            )
             encoded = self._model.encode(
-                missing_inputs,
+                [raw_texts[index] for index in missing_indices],
+                prompt=prefix,
                 batch_size=batch_size,
-                **kwargs,
+                convert_to_numpy=True,
+                show_progress_bar=bool(kwargs.get("show_progress_bar", False)),
             )
             if hasattr(encoded, "detach"):
                 encoded = encoded.detach().cpu().numpy()
@@ -336,3 +344,12 @@ class CachedBackbone:
 
     def __del__(self) -> None:
         self.close()
+
+
+def run_model_meta(backbone: Backbone, revision: str) -> Any:
+    """`ModelMeta` that gives one grid run its own slot in MTEB's result cache."""
+    from mteb.models.model_meta import ModelMeta
+
+    return ModelMeta.create_empty(
+        overwrites={"name": f"geopres-grid/{backbone.key}", "revision": revision}
+    )

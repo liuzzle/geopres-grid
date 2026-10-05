@@ -244,8 +244,13 @@ BITS_PER_DIM: dict[str, int] = {
     "int4": 4,
     "uint4": 4,
     "equal_count_4": 4,
+    "int2": 2,
+    "uint2": 2,
+    "equal_count_2": 2,
     "binary": 1,
 }
+"""Stored bits per dimension. The widths are Kisako et al.'s grid
+(arXiv:2606.01074 §3.4, b in {1, 2, 4, 8, 16, 32}); `none` is the fp32 original."""
 
 DR_METHODS = (
     "none",
@@ -262,10 +267,12 @@ DR_METHODS = (
 class PostProcConfig:
     """What happens to a cached vector on the way to a score.
 
-    Default normalisation is `normalize -> reduce -> normalize`. The first puts all
-    backbones on the unit sphere so one calibration can serve them; the second is a
-    no-op for cosine scoring and exists only because scalar quantization is not
-    scale-invariant and reduction does not preserve norms.
+    Default normalisation is `normalize -> reduce -> normalize`. The first puts every
+    backbone on the unit sphere: all five score by cosine, so only direction
+    carries meaning, and it stops the two non-normalising stacks' per-vector norm
+    spread from entering PCA's mean and the quantizer's fitted ranges. The second
+    is a no-op for cosine scoring and exists only because scalar quantization is
+    not scale-invariant and reduction does not preserve norms.
     """
 
     normalize_before: bool = True
