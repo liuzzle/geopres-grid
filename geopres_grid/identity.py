@@ -354,6 +354,13 @@ class PostProcConfig:
             raise ValueError("dr_weights_id is required by dr_method='geopres', and only there")
 
     @property
+    def is_identity(self) -> bool:
+        """No reduction and no quantization: scores exactly as the backbone's fp32
+        baseline, since every backbone scores by cosine and normalisation is then a
+        no-op. Such a cell is not scored separately (`evaluation.evaluate_cell`)."""
+        return self.dr_method == "none" and self.quant_method == "none"
+
+    @property
     def resolved_dr_seed(self) -> int:
         """The seed the reducer actually uses."""
         return self.dr_seed if self.dr_seed is not None else DEFAULT_DR_SEED

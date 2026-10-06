@@ -300,7 +300,10 @@ def evaluate_cell(
     2. Fit on each leaf task's cached inputs (Kisako et al. §3.5).
     3. Score the cell, stored under the run id.
     Each result slot gets its run record in `runs/` beside MTEB's `results/`.
-    Returns the two `ModelResult`s, warm-up first.
+    Returns the two `ModelResult`s, warm-up first. An identity cell
+    (`PostProcConfig.is_identity`) would score exactly as the warm-up, in a
+    second slot that duplicates the baseline row; it is skipped and the warm-up
+    is returned twice.
     """
     import mteb
 
@@ -308,6 +311,8 @@ def evaluate_cell(
     kwargs = {"cache": cache}
     write_run_record(cache.cache_path, run_record(cell.cached, None))
     baseline = mteb.evaluate(cell.cached, task, encode_kwargs=encode_kwargs, **kwargs)
+    if cell.config.is_identity:
+        return baseline, baseline
     for leaf in leaf_tasks(task):
         blocks = cached_blocks(
             cell.cached.task_directory(leaf.metadata.name),

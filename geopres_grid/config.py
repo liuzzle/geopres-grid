@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 
 DTYPE_ALIASES = {

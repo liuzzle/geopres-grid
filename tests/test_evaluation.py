@@ -8,6 +8,7 @@ from geopres_grid.evaluation import BEIR_TASKS
 from geopres_grid.evaluation import NANOBEIR_TASKS
 from geopres_grid.evaluation import PostProcessedBackbone
 from geopres_grid.evaluation import cached_blocks
+from geopres_grid.evaluation import evaluate_cell
 from geopres_grid.evaluation import sample_rows
 from geopres_grid.evaluation import task_names
 from geopres_grid.identity import EncodeConfig
@@ -162,3 +163,28 @@ def test_each_cell_gets_its_own_result_slot(tmp_path):
 
     assert int8.mteb_model_meta.revision == int8.run_id.value
     assert len({cached.mteb_model_meta.revision, int8.mteb_model_meta.revision, int4.mteb_model_meta.revision}) == 3
+
+
+class FakeResultCache:
+    def __init__(self, path):
+        self.cache_path = path
+
+
+@pytest.mark.parametrize("config", [PostProcConfig(), PostProcConfig(normalize_before=False)])
+def test_an_identity_cell_is_not_scored_twice(tmp_path, monkeypatch, config):
+    """It would score as the baseline does, in a second slot: a duplicate row."""
+    calls = []
+    monkeypatch.setattr(mteb, "evaluate", lambda model, task, **kwargs: calls.append(model) or "scores")
+    cell = PostProcessedBackbone(make_cached(tmp_path / "cache"), config)
+
+    baseline, scored = evaluate_cell(cell, object(), results_cache=FakeResultCache(tmp_path / "results"))
+
+    assert calls == [cell.cached]
+    assert baseline == scored == "scores"
+    records = list((tmp_path / "results").rglob("*.json"))
+    assert [record.stem for record in records] == [cell.cached.encode_config.hash]
+
+
+def test_a_reducing_or_quantizing_cell_is_not_identity():
+    assert not PostProcConfig(quant_method="int8").is_identity
+    assert not PostProcConfig(dr_method="truncate", target_dim=4).is_identity
