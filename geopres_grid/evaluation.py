@@ -11,7 +11,7 @@ calibration corpus, and the write-up should carry the same caveat.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +22,7 @@ from geopres_grid.identity import PostProcConfig, RunId
 from geopres_grid.precompute import leaf_tasks
 from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
 from geopres_grid.reducers import PostProcessingPipeline
+from geopres_grid.results import write_run_record
 
 Tier = Literal["tier0", "tier1", "tier2"]
 
@@ -244,6 +245,47 @@ class PostProcessedBackbone:
         return fake_quantize(fitted.pipeline.transform(values), quantizer)
 
 
+def run_record(cached: CachedBackbone, config: PostProcConfig | None) -> dict[str, Any]:
+    """What one result slot holds, for `results.load_results` to join back in.
+
+    `config=None` is the warm-up pass: the backbone's raw fp32 output, which scores
+    identically to `PostProcConfig()` under cosine.
+    """
+    source_dim = cached.backbone.native_dim
+    record = {
+        "backbone": cached.backbone.key,
+        "model_id": cached.backbone.model_id,
+        "encode": cached.encode_config.to_meta(),
+    }
+    if config is None:
+        return {
+            **record,
+            "kind": "baseline",
+            "revision": cached.encode_config.hash,
+            "postproc": None,
+            "output_dim": source_dim,
+            "bits_per_dim": 32,
+            "bytes_per_vector": source_dim * 4,
+            "compression_factor": 1.0,
+            "calibration": None,
+        }
+    return {
+        **record,
+        "kind": "cell",
+        "revision": RunId(cached.encode_config, config).value,
+        "postproc": asdict(config),
+        "output_dim": config.output_dim(source_dim),
+        "bits_per_dim": config.bits_per_dim,
+        "bytes_per_vector": config.bytes_per_vector(source_dim),
+        "compression_factor": config.compression_factor(source_dim),
+        "calibration": {
+            "max_rows": CALIBRATION_MAX_ROWS,
+            "seed": CALIBRATION_SEED,
+            "sample": "the task's cached inputs, both sides (Kisako et al. §3.5)",
+        },
+    }
+
+
 def evaluate_cell(
     cell: PostProcessedBackbone,
     task: Any,
@@ -257,11 +299,14 @@ def evaluate_cell(
        and is the fp32 baseline of this backbone, stored under the encode hash.
     2. Fit on each leaf task's cached inputs (Kisako et al. §3.5).
     3. Score the cell, stored under the run id.
+    Each result slot gets its run record in `runs/` beside MTEB's `results/`.
     Returns the two `ModelResult`s, warm-up first.
     """
     import mteb
 
-    kwargs = {"cache": results_cache} if results_cache is not None else {}
+    cache = results_cache if results_cache is not None else mteb.ResultCache()
+    kwargs = {"cache": cache}
+    write_run_record(cache.cache_path, run_record(cell.cached, None))
     baseline = mteb.evaluate(cell.cached, task, encode_kwargs=encode_kwargs, **kwargs)
     for leaf in leaf_tasks(task):
         blocks = cached_blocks(
@@ -270,5 +315,6 @@ def evaluate_cell(
             subsets=list(leaf.hf_subsets),
         )
         cell.fit_task(leaf.metadata.name, blocks)
+    write_run_record(cache.cache_path, run_record(cell.cached, cell.config))
     scored = mteb.evaluate(cell, task, encode_kwargs=encode_kwargs, **kwargs)
     return baseline, scored

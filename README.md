@@ -63,6 +63,12 @@ uv run python scripts/evaluate.py --backbone lfm25 --task NanoArguAnaRetrieval \
 uv run python scripts/symmetry_ablation.py --backbone lfm25 --task NanoArguAnaRetrieval
 ```
 
+`uv run python scripts/collect_results.py` then writes `results.csv` (tidy: one row per
+run x task x split, configuration in columns) and `comparison_results.csv` (upstream
+GeoPres's wide layout: a row per run, a column per task, per-type averages) to the
+results root. Result folders are named by hash; each run's configuration is in
+`runs/<run id>.json` beside them.
+
 Per task, `evaluate.py` runs a warm-up pass (the backbone's fp32 baseline), fits PCA
 and the quantization table once on up to 10,000 of that task's cached embeddings, and
 then scores the cell -- the calibration protocol of Kisako et al. (arXiv:2606.01074,

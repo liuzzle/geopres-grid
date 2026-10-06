@@ -1,8 +1,12 @@
 """Merge MTEB result caches into a single comparison CSV.
 
-Carried over unchanged apart from the import. WP-B seam: it keys rows on the old
-`<backbone>_reduced_<dim>_batch_<n>_...` model-name convention, which the
-run-id/config-hash scheme replaces.
+Carried over unchanged apart from the import. Superseded for this project's
+results by `scripts/collect_results.py`, which joins hashed result slots to their
+run records; `geopres_grid.results.load_upstream_results` reads upstream trees into
+the same schema. Kept only to reproduce upstream's own CSV, which its LaTeX and
+plot scripts expect. It keys rows on the old `<backbone>_reduced_<dim>_...`
+model-name convention and reads only the `test` split, so it raises on NanoBEIR
+(`train`) and MSMARCO (`dev`) results.
 """
 
 import os
