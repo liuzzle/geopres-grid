@@ -303,3 +303,15 @@ def test_the_two_known_mrl_models_are_the_controls():
         b = backbones.get(key)
         assert b.mrl_dims, f"{key} is supposed to be a documented-MRL control"
         assert b.mrl_probe, f"control {key} was never run through the probe"
+
+
+@pytest.mark.parametrize("backbone", list(backbones.BACKBONES.values()), ids=lambda b: b.key)
+def test_symmetric_prompt_follows_the_sts_rule(backbone):
+    """Dedicated STS prompt if the model declares one, else the query prompt
+    (Andrianos, 06.10.2026). Never chosen per model by score."""
+    dedicated = [name for name in (backbone.prompts or {}) if "sts" in name.lower()]
+    if dedicated:
+        assert backbone.symmetric_prompt_name in dedicated
+    else:
+        assert backbone.symmetric_prompt_name is None
+        assert backbone.prompt_for("symmetric") == backbone.prompt_for("query")

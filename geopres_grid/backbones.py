@@ -91,9 +91,11 @@ class Backbone:
     """Key into `prompts` for tasks MTEB encodes without a `prompt_type` (STS), where
     both texts of a pair go through one side. None falls back to the query prompt.
 
-    Set where the model declares a prompt for that use and a published evaluation
-    applies it, so the query prompt would be the wrong instruction. Cite it in
-    `prompt_source`. Mirrored into `EncodeConfig.symmetric_prompt_name`.
+    The rule (Andrianos, 06.10.2026): a model with a dedicated STS prompt uses it;
+    every other model uses its query prompt -- read as "what follows is a short
+    text" -- even where that costs it, because the rule is applied consistently
+    and never tuned per model. Cite the dedicated prompt in `prompt_source`.
+    Mirrored into `EncodeConfig.symmetric_prompt_name`.
     """
 
     prompt_source: str = ""
