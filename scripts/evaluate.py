@@ -22,7 +22,7 @@ from geopres_grid.backbones import PRIMARY_MAX_SEQ_LENGTH, get, require_runnable
 from geopres_grid.cache import CachedBackbone
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, resolve_device
 from geopres_grid.evaluation import PostProcessedBackbone, evaluate_cell, task_names
-from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, EncodeConfig, PostProcConfig
+from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, EncodeConfig, PostProcConfig, weights_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,10 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    weights = np.load(args.geopres_weights) if args.geopres_weights else None
     postproc = PostProcConfig(
         dr_method=args.dr_method,
         target_dim=args.target_dim,
         dr_seed=args.dr_seed,
+        dr_weights_id=weights_id(weights) if weights is not None else None,
         quant_method=args.quant_method,
         quant_symmetric=not args.per_side_calibration,
     )
@@ -77,9 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         dtype="float32",
         device=device,
         batch_size=args.batch_size,
+        symmetric_prompt_name=backbone.symmetric_prompt_name,
     )
     cached = CachedBackbone(model, backbone, encode_config, Path(args.cache_root))
-    weights = np.load(args.geopres_weights) if args.geopres_weights else None
     cell = PostProcessedBackbone(cached, postproc, geopres_weights=weights)
     results_cache = mteb.ResultCache(args.results_root)
     print(f"run id {cell.run_id}  ({postproc.bits_per_dim} bits/dim)")

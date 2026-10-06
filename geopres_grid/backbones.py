@@ -87,6 +87,15 @@ class Backbone:
     Adding one would be off-distribution for the model.
     """
 
+    symmetric_prompt_name: str | None = None
+    """Key into `prompts` for tasks MTEB encodes without a `prompt_type` (STS), where
+    both texts of a pair go through one side. None falls back to the query prompt.
+
+    Set where the model declares a prompt for that use and a published evaluation
+    applies it, so the query prompt would be the wrong instruction. Cite it in
+    `prompt_source`. Mirrored into `EncodeConfig.symmetric_prompt_name`.
+    """
+
     prompt_source: str = ""
     """Citation for the two prompt-name fields -- where the query/document split is
     documented, in the model's own words."""
@@ -143,12 +152,15 @@ class Backbone:
         return bool(self.mrl_dims) and dim in self.mrl_dims
 
     def prompt_name_for(self, side: str) -> str | None:
-        """Prompt name to pass to `encode` for `side` in ("query", "document")."""
+        """Prompt name to pass to `encode` for `side` in ("query", "document",
+        "symmetric"). "symmetric" is a task without a `prompt_type`."""
         if side == "query":
             return self.query_prompt_name
         if side == "document":
             return self.document_prompt_name
-        raise ValueError(f"side must be 'query' or 'document', got {side!r}")
+        if side == "symmetric":
+            return self.symmetric_prompt_name or self.query_prompt_name
+        raise ValueError(f"side must be 'query', 'document' or 'symmetric', got {side!r}")
 
     def prompt_for(self, side: str) -> str:
         """The literal prefix prepended to text on `side`. Empty string when bare.
@@ -365,6 +377,7 @@ BACKBONES: dict[str, Backbone] = {
             },
             query_prompt_name="web_search_query",
             document_prompt_name=None,
+            symmetric_prompt_name="sts_query",
             prompt_source=(
                 "Model card usage example, which is the only documentation of the "
                 "split: `query_embeddings = model.encode(queries, "
@@ -373,7 +386,12 @@ BACKBONES: dict[str, Backbone] = {
                 "prompt at all. Confirmed by the maintainers: 'Yes, this is how the "
                 "model is trained, otherwise you will see a performance degradation.' "
                 "The three declared prompts are all *query*-side and task-specific; "
-                "`web_search_query` is the retrieval one. Checked 17.09.2026."
+                "`web_search_query` is the retrieval one. Checked 17.09.2026. "
+                "Symmetric tasks (STS) take `sts_query` on both texts: it is the "
+                "instruction mteb 2.15.1's own harrier implementation "
+                "(`harrier_models.py`, `harrier_task_prompts`) gives STSBenchmark, "
+                "STS12-17 and SICK-R alike; the retrieval prompt was being applied "
+                "there before 06.10.2026."
             ),
             mrl_checked=True,
             mrl_source=(
@@ -415,6 +433,7 @@ BACKBONES: dict[str, Backbone] = {
             },
             query_prompt_name="web_search_query",
             document_prompt_name=None,
+            symmetric_prompt_name="sts_query",
             prompt_source=(
                 "Model card usage example, which is the only documentation of the "
                 "split: `query_embeddings = model.encode(queries, "
@@ -423,7 +442,12 @@ BACKBONES: dict[str, Backbone] = {
                 "prompt at all. Confirmed by the maintainers: 'Yes, this is how the "
                 "model is trained, otherwise you will see a performance degradation.' "
                 "The three declared prompts are all *query*-side and task-specific; "
-                "`web_search_query` is the retrieval one. Checked 17.09.2026."
+                "`web_search_query` is the retrieval one. Checked 17.09.2026. "
+                "Symmetric tasks (STS) take `sts_query` on both texts: it is the "
+                "instruction mteb 2.15.1's own harrier implementation "
+                "(`harrier_models.py`, `harrier_task_prompts`) gives STSBenchmark, "
+                "STS12-17 and SICK-R alike; the retrieval prompt was being applied "
+                "there before 06.10.2026."
             ),
             mrl_checked=True,
             mrl_source=(

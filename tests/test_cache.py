@@ -55,7 +55,7 @@ class FakeModel:
         return np.sum(np.asarray(embeddings1) * np.asarray(embeddings2), axis=1)
 
 
-def make_encode_config():
+def make_encode_config(**overrides):
     return EncodeConfig(
         model_id="fake/model",
         revision="a" * 40,
@@ -64,7 +64,12 @@ def make_encode_config():
         prompts=(("query", "query: "), ("document", "document: ")),
         sentence_transformers_version="5.7",
         transformers_version="4.56",
+        **overrides,
     )
+
+
+def harrier_encode_config():
+    return make_encode_config(symmetric_prompt_name="sts_query")
 
 
 def test_round_trip_preserves_order_and_metadata(tmp_path):
@@ -273,7 +278,7 @@ def test_cached_backbone_encodes_the_prepared_text_under_its_own_key(tmp_path):
 
 def test_cached_backbone_passes_an_empty_prompt_on_a_bare_side(tmp_path):
     model = FakeModel()
-    wrapper = CachedBackbone(model, get("harrier-270m"), make_encode_config(), tmp_path)
+    wrapper = CachedBackbone(model, get("harrier-270m"), harrier_encode_config(), tmp_path)
 
     wrapper.encode(
         FakeInputs([{"id": "d1", "text": "body"}]),
@@ -295,3 +300,44 @@ def test_run_model_meta_gives_each_encode_config_its_own_result_slot(tmp_path):
     assert first.mteb_model_meta.name == "geopres-grid/mdenseon"
     assert first.mteb_model_meta.revision == make_encode_config().hash
     assert first.mteb_model_meta.revision != second.mteb_model_meta.revision
+
+
+def test_a_task_without_prompt_type_gets_the_symmetric_prompt(tmp_path):
+    """harrier's STS pairs take `sts_query`, not the retrieval instruction."""
+    harrier = get("harrier-270m")
+    model = FakeModel()
+    wrapper = CachedBackbone(model, harrier, harrier_encode_config(), tmp_path)
+
+    wrapper.encode(
+        FakeInputs([{"id": "s1", "text": "a sentence"}]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type=None,
+    )
+
+    assert model.prompts == [harrier.prompts["sts_query"]]
+    # The cache side is still `query`: one side per STS task, as before.
+    assert (wrapper.task_directory(FakeMetadata().name) / "test" / "default" / "query").exists()
+
+
+def test_a_backbone_without_a_symmetric_prompt_uses_its_query_prompt(tmp_path):
+    model = FakeModel()
+    wrapper = CachedBackbone(model, get("mdenseon"), make_encode_config(), tmp_path)
+
+    wrapper.encode(
+        FakeInputs([{"id": "s1", "text": "a sentence"}]),
+        task_metadata=FakeMetadata(),
+        hf_split="test",
+        hf_subset="default",
+        prompt_type=None,
+    )
+
+    assert model.prompts == [get("mdenseon").prompt_for("query")]
+
+
+def test_encode_config_must_name_the_backbones_symmetric_prompt(tmp_path):
+    """Otherwise the STS prompt changes while the cache directory and the result
+    slot -- both named by the encode hash -- stay where the old prompt's are."""
+    with pytest.raises(ValueError, match="symmetric prompt"):
+        CachedBackbone(FakeModel(), get("harrier-270m"), make_encode_config(), tmp_path)

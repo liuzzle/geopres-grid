@@ -213,6 +213,15 @@ def side_of(prompt_type: Any) -> str:
     raise ValueError(f"Unsupported MTEB prompt_type: {prompt_type!r}")
 
 
+def prompt_side(prompt_type: Any) -> str:
+    """Which registry prompt an MTEB `prompt_type` gets: `side_of`, except that a
+    task without one is "symmetric" (`Backbone.symmetric_prompt_name`). The cache
+    path and the quantizer still use `side_of`."""
+    if getattr(prompt_type, "value", prompt_type) is None:
+        return "symmetric"
+    return side_of(prompt_type)
+
+
 class CachedBackbone:
     """MTEB encoder wrapper backed by prompt-aware ``GeoPresCache`` blocks.
 
@@ -231,6 +240,12 @@ class CachedBackbone:
         encode_config: EncodeConfig,
         cache_root: str | Path,
     ) -> None:
+        if encode_config.symmetric_prompt_name != backbone.symmetric_prompt_name:
+            raise ValueError(
+                f"EncodeConfig names symmetric prompt {encode_config.symmetric_prompt_name!r} "
+                f"but {backbone.key} uses {backbone.symmetric_prompt_name!r}; pass "
+                "symmetric_prompt_name=backbone.symmetric_prompt_name to from_model"
+            )
         self._model = model
         self.backbone = backbone
         self.encode_config = encode_config
@@ -302,7 +317,7 @@ class CachedBackbone:
         side = self._side(prompt_type)
         items = self._items(inputs)
         raw_texts = [str(item.get("text", "")) for item in items]
-        prefix = self.backbone.prompt_for(side)
+        prefix = self.backbone.prompt_for(prompt_side(prompt_type))
         prompted_texts = [prefix + text for text in raw_texts]
         cache = self._get_cache(
             self._cache_path(task_metadata.name, hf_split, hf_subset, side)
@@ -339,7 +354,7 @@ class CachedBackbone:
         return result
 
     def close(self) -> None:
-        for cache in self._caches.values():
+        for cache in getattr(self, "_caches", {}).values():
             cache.close()
 
     def __del__(self) -> None:

@@ -1,5 +1,7 @@
 import numpy as np
+import pytest
 
+from geopres_grid.identity import PostProcConfig, weights_id
 from geopres_grid.reducers import GeoPres
 from geopres_grid.reducers import Identity
 from geopres_grid.reducers import PCA
@@ -10,7 +12,6 @@ from geopres_grid.reducers import RandomSelection
 from geopres_grid.reducers import Truncate
 from geopres_grid.reducers import apply_reduction
 from geopres_grid.reducers import reducer_from_config
-from geopres_grid.identity import PostProcConfig
 
 
 def test_truncate_is_a_slice():
@@ -73,7 +74,7 @@ def test_reducer_from_config_selects_configured_methods():
     assert type(reducer_from_config(PostProcConfig(dr_method="random_selection", target_dim=2), 8)).__name__ == "RandomSelection"
 
     try:
-        reducer_from_config(PostProcConfig(dr_method="geopres", target_dim=2), 8)
+        reducer_from_config(PostProcConfig(dr_method="geopres", target_dim=2, dr_weights_id="0" * 16), 8)
     except ValueError as error:
         assert "geopres_weights" in str(error)
     else:
@@ -115,3 +116,11 @@ def test_post_processing_pipeline_requires_fit():
         assert "fitted" in str(error)
     else:
         raise AssertionError("transform before fit must fail")
+
+def test_geopres_weights_must_match_the_configured_weights_id():
+    weights = np.arange(16, dtype=np.float32).reshape(2, 8)
+    config = PostProcConfig(dr_method="geopres", target_dim=2, dr_weights_id=weights_id(weights))
+    assert type(reducer_from_config(config, 8, geopres_weights=weights)) is GeoPres
+
+    with pytest.raises(ValueError, match="dr_weights_id"):
+        reducer_from_config(config, 8, geopres_weights=weights + 1)

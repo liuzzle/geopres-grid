@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         dtype=args.dtype,
         device=device,
         batch_size=args.batch_size,
+        symmetric_prompt_name=backbone.symmetric_prompt_name,
     )
 
     import mteb

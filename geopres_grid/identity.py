@@ -111,6 +111,16 @@ class EncodeConfig:
     transformers_version: str
     external_code_revisions: tuple[tuple[str, str], ...] = ()
     """repo id -> commit sha for code loaded from outside the model's own repo."""
+    symmetric_prompt_name: str | None = None
+    """Prompt applied to tasks MTEB encodes without a `prompt_type` (STS), when it
+    is not the query prompt. `Backbone.symmetric_prompt_name`.
+
+    Hashed only when set: `prompts` pins every prefix the model declares but not
+    which one a symmetric task gets, and the result slot is named by this hash, so
+    a changed choice must move it or MTEB's `only-missing` returns the old scores.
+    Left out of the payload when None, so the hash of every backbone that uses its
+    query prompt there is unchanged.
+    """
 
     # Recorded, not hashed. See `to_meta`.
     torch_version: str = ""
@@ -149,6 +159,8 @@ class EncodeConfig:
             payload[name] = (
                 {k: v for k, v in value} if isinstance(value, tuple) else value
             )
+        if self.symmetric_prompt_name is not None:
+            payload["symmetric_prompt_name"] = self.symmetric_prompt_name
         return payload
 
     @property
@@ -194,6 +206,7 @@ class EncodeConfig:
         dtype: str = "float32",
         device: str = "",
         batch_size: int | None = None,
+        symmetric_prompt_name: str | None = None,
         resolve_external_code: bool = True,
         hf_token: str | None = None,
     ) -> EncodeConfig:
@@ -227,6 +240,7 @@ class EncodeConfig:
             ),
             transformers_version=minor_version(transformers.__version__),
             external_code_revisions=tuple(external),
+            symmetric_prompt_name=symmetric_prompt_name,
             torch_version=torch.__version__,
             device=device,
             batch_size=batch_size,
@@ -251,6 +265,30 @@ BITS_PER_DIM: dict[str, int] = {
 }
 """Stored bits per dimension. The widths are Kisako et al.'s grid
 (arXiv:2606.01074 §3.4, b in {1, 2, 4, 8, 16, 32}); `none` is the fp32 original."""
+
+SEEDED_DR_METHODS = ("pca", "pca_ror", "random_projection", "random_selection")
+"""Methods with a random component, and so the only ones a `dr_seed` applies to.
+`pca` is among them: scikit-learn's randomized SVD solver takes the seed."""
+
+DEFAULT_DR_SEED = 42
+"""Seed of a seeded method when `dr_seed` is None. `PostProcConfig` stores this
+value as None, so an explicit 42 and an omitted seed are one configuration."""
+
+
+def weights_id(weights: Any) -> str:
+    """Content hash of a trained projection, for `PostProcConfig.dr_weights_id`.
+
+    Over shape and float32 C-order bytes -- the form `reducers.GeoPres` applies --
+    so the same matrix saved as float64 or transposed-then-copied hashes alike.
+    """
+    import numpy as np
+
+    array = np.ascontiguousarray(np.asarray(weights, dtype=np.float32))
+    digest = hashlib.sha256()
+    digest.update(canonical_json(list(array.shape)).encode("utf-8"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()[:HASH_LENGTH]
+
 
 DR_METHODS = (
     "none",
@@ -279,9 +317,14 @@ class PostProcConfig:
     dr_method: str = "none"
     target_dim: int | None = None
     dr_seed: int | None = None
-    """Seed for methods with a random component: pca_ror, random_projection,
-    random_selection. Part of the hash, because the same method with a different
-    seed is a different transform."""
+    """Seed for `SEEDED_DR_METHODS`. Part of the hash, because the same method with
+    a different seed is a different transform. `DEFAULT_DR_SEED` is stored as None
+    -- the form every existing run id was computed with -- and a seed given to a
+    method without a random component is an error rather than a silent new hash."""
+    dr_weights_id: str | None = None
+    """`weights_id` of the trained projection, required by `geopres` and only there.
+    Without it two different projections at one `target_dim` share a run id, and so
+    one MTEB result slot. Hashed only when set, so no other run id changes."""
     normalize_after: bool = True
     quant_method: str = "none"
     quant_symmetric: bool = True
@@ -303,21 +346,33 @@ class PostProcConfig:
             raise ValueError(f"dr_method={self.dr_method!r} requires a target_dim")
         if self.dr_method == "none" and self.target_dim is not None:
             raise ValueError("target_dim is meaningless with dr_method='none'")
+        if self.dr_seed == DEFAULT_DR_SEED:
+            object.__setattr__(self, "dr_seed", None)
+        if self.dr_seed is not None and self.dr_method not in SEEDED_DR_METHODS:
+            raise ValueError(f"dr_method={self.dr_method!r} takes no dr_seed")
+        if (self.dr_method == "geopres") != (self.dr_weights_id is not None):
+            raise ValueError("dr_weights_id is required by dr_method='geopres', and only there")
+
+    @property
+    def resolved_dr_seed(self) -> int:
+        """The seed the reducer actually uses."""
+        return self.dr_seed if self.dr_seed is not None else DEFAULT_DR_SEED
 
     @property
     def hash(self) -> str:
-        return config_hash(
-            {
-                "normalize_before": self.normalize_before,
-                "dr_method": self.dr_method,
-                "target_dim": self.target_dim,
-                "dr_seed": self.dr_seed,
-                "normalize_after": self.normalize_after,
-                "quant_method": self.quant_method,
-                "quant_symmetric": self.quant_symmetric,
-                "quant_calibration_id": self.quant_calibration_id,
-            }
-        )
+        payload = {
+            "normalize_before": self.normalize_before,
+            "dr_method": self.dr_method,
+            "target_dim": self.target_dim,
+            "dr_seed": self.dr_seed,
+            "normalize_after": self.normalize_after,
+            "quant_method": self.quant_method,
+            "quant_symmetric": self.quant_symmetric,
+            "quant_calibration_id": self.quant_calibration_id,
+        }
+        if self.dr_weights_id is not None:
+            payload["dr_weights_id"] = self.dr_weights_id
+        return config_hash(payload)
 
     @property
     def bits_per_dim(self) -> int:

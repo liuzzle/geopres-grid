@@ -13,6 +13,7 @@ import pytest
 
 from geopres_grid.identity import (
     BITS_PER_DIM,
+    DEFAULT_DR_SEED,
     EncodeConfig,
     PostProcConfig,
     RunId,
@@ -20,6 +21,7 @@ from geopres_grid.identity import (
     config_hash,
     external_code_repos,
     minor_version,
+    weights_id,
 )
 
 
@@ -233,3 +235,46 @@ def test_config_hash_is_short_and_hex():
     digest = config_hash({"a": 1})
     assert len(digest) == 16
     int(digest, 16)
+
+
+def test_default_seed_and_omitted_seed_are_one_configuration():
+    omitted = PostProcConfig(dr_method="pca_ror", target_dim=256)
+    explicit = PostProcConfig(dr_method="pca_ror", target_dim=256, dr_seed=DEFAULT_DR_SEED)
+    assert explicit.dr_seed is None
+    assert omitted.hash == explicit.hash
+    assert omitted.resolved_dr_seed == DEFAULT_DR_SEED
+
+
+def test_existing_run_ids_are_unchanged():
+    """The 04.10 harrier-270m cells. The seed and weights fields must not move them."""
+    assert PostProcConfig(dr_method="pca", target_dim=128, quant_method="int4").hash == "33dfe7bbaee5a815"
+    assert PostProcConfig(dr_method="pca_ror", target_dim=128).hash == "c3e71e921b1ec653"
+
+
+def test_a_seed_for_a_method_without_randomness_is_rejected():
+    with pytest.raises(ValueError, match="dr_seed"):
+        PostProcConfig(dr_method="truncate", target_dim=64, dr_seed=1)
+
+
+def test_geopres_requires_a_weights_id_and_nothing_else_takes_one():
+    with pytest.raises(ValueError, match="dr_weights_id"):
+        PostProcConfig(dr_method="geopres", target_dim=64)
+    with pytest.raises(ValueError, match="dr_weights_id"):
+        PostProcConfig(dr_method="pca", target_dim=64, dr_weights_id="0" * 16)
+
+
+def test_two_projections_at_one_dim_get_two_run_ids():
+    import numpy as np
+
+    first = np.zeros((4, 8), dtype=np.float32)
+    second = np.ones((4, 8), dtype=np.float32)
+    a = PostProcConfig(dr_method="geopres", target_dim=4, dr_weights_id=weights_id(first))
+    b = PostProcConfig(dr_method="geopres", target_dim=4, dr_weights_id=weights_id(second))
+    assert a.hash != b.hash
+    assert weights_id(first) == weights_id(first.astype(np.float64))
+
+
+def test_symmetric_prompt_moves_the_encode_hash_only_when_set():
+    base = make_encode()
+    assert "symmetric_prompt_name" not in base.to_hashable()
+    assert make_encode(symmetric_prompt_name="sts_query").hash != base.hash

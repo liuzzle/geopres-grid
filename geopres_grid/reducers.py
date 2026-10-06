@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from sklearn.decomposition import PCA as SklearnPCA
 
-from geopres_grid.identity import PostProcConfig
+from geopres_grid.identity import PostProcConfig, weights_id
 
 
 def _unit_norm(values: np.ndarray) -> np.ndarray:
@@ -309,7 +309,7 @@ def reducer_from_config(
 ) -> Reducer:
     """Construct the configured reducer for one cached embedding dimension."""
     target_dim = config.target_dim
-    seed = config.dr_seed if config.dr_seed is not None else 42
+    seed = config.resolved_dr_seed
     if config.dr_method == "none":
         return Identity()
     if target_dim is None:
@@ -325,6 +325,12 @@ def reducer_from_config(
     if config.dr_method == "geopres":
         if geopres_weights is None:
             raise ValueError("geopres_weights is required for dr_method='geopres'")
+        if weights_id(geopres_weights) != config.dr_weights_id:
+            raise ValueError(
+                f"geopres_weights hash to {weights_id(geopres_weights)}, but the config "
+                f"names dr_weights_id={config.dr_weights_id}; the run id would not "
+                "identify the projection that was applied"
+            )
         return GeoPres(weights=geopres_weights)
     if config.dr_method == "random_projection":
         return RandomProjection(target_dim, seed)

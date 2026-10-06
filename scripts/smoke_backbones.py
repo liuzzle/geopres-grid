@@ -146,6 +146,7 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
         model_id=backbone.model_id,
         revision=backbone.revision,
         device="cpu",
+        symmetric_prompt_name=backbone.symmetric_prompt_name,
     )
 
     del model
