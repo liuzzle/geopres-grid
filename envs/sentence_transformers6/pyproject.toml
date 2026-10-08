@@ -1,0 +1,65 @@
+# The sentence-transformers 6.x environment, for google/embeddinggemma-2 only.
+#
+# Why this file exists, in one line: EmbeddingGemma-2 cannot load on
+# sentence-transformers 5.x, and the project pins <6.0 on supervisor guidance.
+#
+# The evidence, from loading the model on 07.10.2026 rather than from metadata:
+#
+#   ST 5.7 + transformers 5.19   ModuleNotFoundError: No module named
+#                                'sentence_transformers.base.modules.normalize'.
+#                                The checkpoint's modules.json names that path;
+#                                5.7 has `base.modules` but no `normalize` in it.
+#   ST 6.1 + transformers 5.19   loads, 768-d, unit norm, cosine.
+#   transformers <= 5.18         no `embedding_gemma2` model type (5.19.0 is the
+#                                first release that ships it).
+#
+# Rather than lifting the <6.0 ceiling for every model -- which the supervisor
+# advised against and which would need the whole set retested -- the one model
+# that needs 6.x gets its own environment. Only precomputation runs here.
+#
+#     uv sync  --project envs/sentence_transformers6
+#     uv run   --project envs/sentence_transformers6 python scripts/smoke_backbones.py
+#     uv run   --project envs/sentence_transformers6 python scripts/precompute.py \
+#                  --backbone embeddinggemma-2 --tier tier1
+#
+# The cache is environment-independent: it stores plain fp32 arrays, so DR,
+# quantization and scoring all run in the root environment no matter which
+# environment produced the embeddings.
+
+[project]
+name = "geopres-grid-st6"
+version = "0.1.0"
+description = "sentence-transformers 6.x environment for the backbone that requires it."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "geopres-grid",
+    # The checkpoint's EmbeddingGemma2Processor imports its image and video
+    # processors even for text-only input: without PIL loading fails with
+    # "requires the PIL library", without torchvision with "Could not import
+    # module 'EmbeddingGemma2Processor'" (gemma4/image_processing_gemma4.py
+    # imports torchvision.transforms.v2). Found by scripts/smoke_backbones.py on
+    # 07.10.2026.
+    "pillow",
+    "torchvision",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+# Overrides, not constraints: the root package pins transformers==4.56.0 and
+# sentence-transformers<6.0, and only an override wins against those.
+# (Must stay above [tool.uv.sources]: in TOML, keys after a sub-table header
+# belong to that sub-table.)
+override-dependencies = [
+    "sentence-transformers>=6.1.0,<7.0.0",
+    "transformers>=5.19.0,<6.0.0",
+    "tokenizers>=0.23.0,<0.24.0",
+    # As in envs/transformers5: transformers 5.x requires the 1.x hub client.
+    "huggingface-hub>=1.3.0,<2.0",
+]
+
+[tool.uv.sources]
+geopres-grid = { path = "../..", editable = true }

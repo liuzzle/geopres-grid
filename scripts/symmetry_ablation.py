@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from geopres_grid.backbones import get
+from geopres_grid.cache import backbone_cache_root, resolve_encode_config
 from geopres_grid.evaluation import CALIBRATION_MAX_ROWS, CALIBRATION_SEED, cached_blocks, sample_rows
 from geopres_grid.identity import DR_METHODS, PostProcConfig
 from geopres_grid.quantizers import calibration_symmetry_ablation
@@ -27,16 +28,14 @@ def resolve_task_directory(cache_root: Path, backbone_key: str, encode_hash: str
     """`CachedBackbone.task_directory` without loading the model.
 
     The encode hash comes from the model, so it is either given or read off the
-    cache: exactly one hash directory must exist for the backbone.
+    cache (`cache.resolve_encode_config`): exactly one config must match.
     """
     backbone = get(backbone_key)
-    root = cache_root / f"{backbone.slug}@{backbone.revision}"
-    if encode_hash is None:
-        hashes = sorted(path.name for path in root.iterdir() if path.is_dir()) if root.exists() else []
-        if len(hashes) != 1:
-            raise SystemExit(f"pass --encode-hash; found {hashes or 'no'} encode hashes under {root}")
-        encode_hash = hashes[0]
-    return root / encode_hash / task
+    try:
+        config = resolve_encode_config(cache_root, backbone, encode_hash=encode_hash)
+    except LookupError as error:
+        raise SystemExit(str(error)) from error
+    return backbone_cache_root(cache_root, backbone) / config.hash / task
 
 
 def main(argv: list[str] | None = None) -> int:

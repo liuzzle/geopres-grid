@@ -9,19 +9,21 @@ is carried over from that repo, everything about caching, quantization and the
 evaluation grid is new here.
 
 
-### Two environments
+### Three environments
 
 No single set of pins runs all five backbones: mGTE only works on `transformers` 4.x,
-mDenseOn only on 5.x. Both were established by loading the models, and neither has an
-upstream fix pending.
+mDenseOn only on 5.x, and EmbeddingGemma-2 only on `sentence-transformers` 6.x, above
+the project's `<6.0` ceiling. All three were established by loading the models.
 
 ```bash
-uv sync                                  # root: mgte, lfm25, harrier-270m, harrier-06b
-uv sync --project envs/transformers5     # mdenseon, lfm25, harrier-270m, harrier-06b
+uv sync                                        # root: mgte, harrier-270m, harrier-06b
+uv sync --project envs/transformers5           # mdenseon, harrier-270m, harrier-06b
+uv sync --project envs/sentence_transformers6  # embeddinggemma-2
 ```
 
-Only precomputation is affected — the cache stores plain fp32 arrays, so everything
-downstream runs in one environment. See `envs/README.md`.
+Only precomputation is affected. The cache stores plain fp32 arrays, so evaluation
+runs in the root environment for every backbone, with no model loaded. See
+`envs/README.md`.
 
 
 ### Backbone table, read from the HF configs
@@ -30,38 +32,72 @@ downstream runs in one environment. See `envs/README.md`.
 |---|---|---|---|---|---|---|
 | `Alibaba-NLP/gte-multilingual-base` | `NewModel` (remote code) | 768 | 8192 | **Normalize** | none | needs `trust_remote_code`; the reason transformers stays on the 4.x line |
 | `lightonai/mDenseOn` | `ModernBertModel` | 768 | 8192 | Pooling | `query: ` / `document: ` | new-style `modules.json` ⇒ **requires ST ≥ 5.4**; tokenizer needs transformers ≥ 5.0 ⇒ runs in `envs/transformers5` |
-| `LiquidAI/LFM2.5-Embedding-350M` | `Lfm2BidirectionalModel` (remote code) | 1024 | **512** | Pooling | `query: ` / `document: ` | shortest context of the five |
 | `microsoft/harrier-oss-v1-270m` | `Gemma3TextModel` | 640 | **no `sentence_bert_config.json`** | **Normalize** | `web_search_query` on queries, documents bare | falls back to tokenizer `model_max_length` (32768); fp16-overflow risk on T4 |
 | `microsoft/harrier-oss-v1-0.6b` | `Qwen3Model` | 1024 | **no `sentence_bert_config.json`** | **Normalize** | `web_search_query` on queries, documents bare | |
+| `google/embeddinggemma-2` | `EmbeddingGemma2Model` | 768 | **none declared** (card: 8192) | **Normalize** | `task: search result \| query: ` / `title: none \| text: `; own STS, classification and clustering prompts | needs **ST ≥ 6.1** and transformers ≥ 5.19 ⇒ `envs/sentence_transformers6`; multimodal checkpoint, text path only; **never fp16** (card: NaN or silently degraded) |
 
+LFM2.5 (`LiquidAI/LFM2.5-Embedding-350M`) was dropped on 07.10.2026: its 512-token
+ceiling capped every model's context and kept MLDR out. Its findings stay in
+`logging.md`.
+
+### Sequence length
+
+`PRIMARY_MAX_SEQ_LENGTH = 8192` for every backbone and every task set, the smallest
+documented context window of the five. It has to be set explicitly: harrier and
+EmbeddingGemma-2 declare no `max_seq_length`, and sentence-transformers then falls
+back to the tokenizer's limit (32768, and about 10^30 for EmbeddingGemma-2).
 ### Matryoshka support
 
 | Model | MRL dimensions | Source |
 |---|---|---|
 | `Alibaba-NLP/gte-multilingual-base` | every multiple of 32 up to 768 | arXiv:2407.19669 §2.2, eq. 3 |
 | `lightonai/mDenseOn` | 128, 256, 512, 768 | arXiv:2607.27178 appendix C.3 |
-| `LiquidAI/LFM2.5-Embedding-350M` | none documented | model card + release blog, checked 15.09.2026; probed 18.09.2026 |
 | `microsoft/harrier-oss-v1-270m` | none documented | model card + Foundry/Bing posts, checked 15.09.2026; probed 18.09.2026 |
 | `microsoft/harrier-oss-v1-0.6b` | none documented | model card + Foundry/Bing posts, checked 15.09.2026; probed 18.09.2026 |
+| `google/embeddinggemma-2` | 128, 256, 512, 768 | model card (no paper yet), checked 07.10.2026; not probed yet |
 
-So an MRL comparison across both MRL backbones is legitimate at **128, 256 and 512**.
-For the other three, truncation is not a zero-overhead DR method. `scripts/probe_mrl.py`
-tested this directly rather than inferring it from silent model cards: at the same k,
-truncation is compared against PCA and against k *randomly chosen* columns, with the two
-documented-MRL models run through the identical measurement as controls. On LFM2.5
-truncation is indistinguishable from random columns; on **both harriers it is worse than
-random columns**, so it is not a naive baseline there but below one. See
+So an MRL comparison across the three MRL backbones is legitimate at **128, 256 and
+512**. For the two harriers, truncation is not a zero-overhead DR method.
+`scripts/probe_mrl.py` tested this directly rather than inferring it from silent model
+cards: at the same k, truncation is compared against PCA and against k *randomly
+chosen* columns, with the documented-MRL models run through the identical measurement
+as controls. On **both harriers truncation is worse than random columns**, so it is
+not a naive baseline there but below one (on the dropped LFM2.5 it was
+indistinguishable from random). Truncation stays in the grid for every model (meeting
+06.10 §1), as an MRL method where documented and as a baseline elsewhere. See
 `docs/README-draft.md`.
 
 
 ### Evaluating a grid cell
 
 ```bash
-uv run python scripts/precompute.py --backbone lfm25 --tier tier1        # GPU: fill the cache
-uv run python scripts/evaluate.py --backbone lfm25 --task NanoArguAnaRetrieval \
-    --dr-method pca_ror --target-dim 128 --quant-method equal_count_4    # CPU: one cell
-uv run python scripts/symmetry_ablation.py --backbone lfm25 --task NanoArguAnaRetrieval
+uv run python scripts/precompute.py --backbone harrier-270m --tier tier1   # GPU: fill the cache
+uv run python scripts/evaluate.py --backbone harrier-270m --task NanoArguAnaRetrieval \
+    --dr-method pca_ror --target-dim 128 --quant-method equal_count_4      # CPU: one cell
+uv run python scripts/symmetry_ablation.py --backbone harrier-270m --task NanoArguAnaRetrieval
 ```
+
+Precompute is the only step that needs a GPU or the backbone's own environment.
+Retrieval tasks have corpus and queries encoded directly; STS, classification and
+clustering get a baseline pass through MTEB on the GPU node, which caches exactly the
+inputs MTEB samples and stores the fp32 scores as a by-product. `evaluate.py` then
+reads the encode config back from the cache's `meta.json` and runs on CPU, in the
+root environment, without loading the model; a cache miss is an error.
+`--load-model` restores encoding for a cold cache on a small task set.
+
+### Task sets
+
+| `--tier` | Tasks | Split |
+|---|---|---|
+| `tier0` | NanoArguAna, STSBenchmark (smoke) | declared |
+| `tier1` | NanoBEIR, 13 tasks (primary) | `train`, the only one |
+| `tier2` | full BEIR, 15 tasks (supplementary) | `test`; MSMARCO `dev` |
+| `nonretrieval` | upstream GeoPres' set: STS12–16, STSBenchmark, SICK-R; AmazonCounterfactual, AmazonReviews, Imdb, ToxicConversations, AmazonPolarity; ArxivClusteringS2S, Reddit, StackExchange clustering | `test` |
+| `mldr` | MultiLongDocRetrieval, 13 languages | `test` |
+
+Every language subset is kept, as upstream did. Symmetric tasks (STS, classification,
+clustering) get the model's dedicated prompt for the task type if it declares one,
+else its query prompt (Andrianos, 06.10, extended per task type 07.10).
 
 `uv run python scripts/collect_results.py` then writes `results.csv` (tidy: one row per
 run x task x split, configuration in columns) and `comparison_results.csv` (upstream

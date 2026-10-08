@@ -274,7 +274,31 @@ def test_two_projections_at_one_dim_get_two_run_ids():
     assert weights_id(first) == weights_id(first.astype(np.float64))
 
 
-def test_symmetric_prompt_moves_the_encode_hash_only_when_set():
+def test_task_prompts_move_the_encode_hash_only_when_set():
     base = make_encode()
-    assert "symmetric_prompt_name" not in base.to_hashable()
-    assert make_encode(symmetric_prompt_name="sts_query").hash != base.hash
+    assert "task_prompt_names" not in base.to_hashable()
+    assert make_encode(task_prompt_names=(("STS", "sts_query"),)).hash != base.hash
+
+
+def test_task_prompt_order_does_not_change_the_hash():
+    one = make_encode(task_prompt_names=(("STS", "a"), ("Clustering", "b")))
+    other = make_encode(task_prompt_names=(("Clustering", "b"), ("STS", "a")))
+    assert one.hash == other.hash
+
+
+def test_from_meta_round_trips_hash_and_provenance():
+    config = make_encode(
+        task_prompt_names=(("STS", "sts_query"),),
+        external_code_revisions=(("Alibaba-NLP/new-impl", "f" * 40),),
+    )
+    rebuilt = EncodeConfig.from_meta(json.loads(json.dumps(config.to_meta())))
+    assert rebuilt == config
+    assert rebuilt.hash == config.hash
+    assert rebuilt.to_meta() == config.to_meta()
+
+
+def test_from_meta_rejects_a_hash_that_does_not_rebuild():
+    meta = make_encode().to_meta()
+    meta["hashed"]["max_seq_length"] = 1
+    with pytest.raises(ValueError, match="rebuild"):
+        EncodeConfig.from_meta(meta)

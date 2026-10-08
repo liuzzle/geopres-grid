@@ -38,12 +38,19 @@ def test_dimension_is_positive(backbone):
 
 @pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
 def test_primary_max_seq_length_is_reachable(backbone):
-    """The shared max_seq_length must not exceed any model's native ceiling."""
-    if backbone.native_max_seq_length is None:
-        return
-    assert backbones.PRIMARY_MAX_SEQ_LENGTH <= backbone.native_max_seq_length, (
-        f"{backbone.key} caps at {backbone.native_max_seq_length}, below the shared "
+    """The shared max_seq_length must not exceed any model's documented window."""
+    assert backbones.PRIMARY_MAX_SEQ_LENGTH <= backbone.context_window, (
+        f"{backbone.key} caps at {backbone.context_window}, below the shared "
         f"{backbones.PRIMARY_MAX_SEQ_LENGTH}"
+    )
+    if backbone.native_max_seq_length is not None:
+        assert backbone.native_max_seq_length <= backbone.context_window
+
+
+def test_primary_max_seq_length_is_the_smallest_context_window():
+    """Not a round number picked by hand: the longest every model can read."""
+    assert backbones.PRIMARY_MAX_SEQ_LENGTH == min(
+        b.context_window for b in backbones.all_backbones()
     )
 
 
@@ -60,7 +67,7 @@ def test_asymmetric_prompt_detection():
     assert not backbones.get("mgte").has_asymmetric_prompts
     # Differing query/document prefixes.
     assert backbones.get("mdenseon").has_asymmetric_prompts
-    assert backbones.get("lfm25").has_asymmetric_prompts
+    assert backbones.get("embeddinggemma-2").has_asymmetric_prompts
     # Instruct-style query prompts only, so documents go unprefixed.
     assert backbones.get("harrier-270m").has_asymmetric_prompts
     assert backbones.get("harrier-06b").has_asymmetric_prompts
@@ -79,12 +86,15 @@ def test_prompt_names_are_resolved_per_side():
     assert backbones.get("mgte").prompt_name_for("query") is None
     assert backbones.get("mgte").prompt_name_for("document") is None
 
-    for key in ("mdenseon", "lfm25"):
-        b = backbones.get(key)
-        assert b.prompt_name_for("query") == "query"
-        assert b.prompt_name_for("document") == "document"
-        assert b.prompt_for("query") == "query: "
-        assert b.prompt_for("document") == "document: "
+    mdenseon = backbones.get("mdenseon")
+    assert mdenseon.prompt_name_for("query") == "query"
+    assert mdenseon.prompt_name_for("document") == "document"
+    assert mdenseon.prompt_for("query") == "query: "
+    assert mdenseon.prompt_for("document") == "document: "
+
+    gemma = backbones.get("embeddinggemma-2")
+    assert gemma.prompt_for("query") == "task: search result | query: "
+    assert gemma.prompt_for("document") == "title: none | text: "
 
     for key in ("harrier-270m", "harrier-06b"):
         b = backbones.get(key)
@@ -102,6 +112,8 @@ def test_prompt_names_exist_in_the_prompts_dict(backbone):
         name = backbone.prompt_name_for(side)
         if name is not None:
             assert backbone.prompts and name in backbone.prompts
+    for name in backbone.task_prompt_names.values():
+        assert backbone.prompts and name in backbone.prompts
     # Resolution must not raise for either side.
     backbone.prompt_for("query")
     backbone.prompt_for("document")
@@ -134,7 +146,7 @@ def test_prompted_text_is_what_a_cache_must_key_on(backbone):
 
 
 # --- Matryoshka support -------------------------------------------------------
-# Two of the five backbones are MRL-trained. 
+# Three of the five backbones are documented as MRL-trained.
 
 
 @pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
@@ -156,6 +168,8 @@ def test_mrl_dims_match_the_papers():
     assert backbones.get("mgte").mrl_dims == tuple(range(32, 769, 32))
     # mDenseOn: exactly the four dimensions named in appendix C.3
     assert backbones.get("mdenseon").mrl_dims == (128, 256, 512, 768)
+    # EmbeddingGemma-2: the card's four, with no paper behind them yet
+    assert backbones.get("embeddinggemma-2").mrl_dims == (128, 256, 512, 768)
 
 
 def test_mrl_validity_check():
@@ -165,12 +179,13 @@ def test_mrl_validity_check():
     # 192 is a multiple of 32 but not one of mDenseOn's four trained dimensions.
     assert not mdenseon.mrl_valid(192)
     # A model with no documented MRL support is never MRL-valid.
-    assert not backbones.get("lfm25").mrl_valid(256)
+    assert not backbones.get("harrier-270m").mrl_valid(256)
 
 
 def test_shared_mrl_dims():
-    """The dimensions where an MRL comparison across both models is legitimate."""
+    """The dimensions where an MRL comparison across the MRL models is legitimate."""
     assert backbones.shared_mrl_dims(["mgte", "mdenseon"]) == [128, 256, 512, 768]
+    assert backbones.shared_mrl_dims(["mgte", "mdenseon", "embeddinggemma-2"]) == [128, 256, 512, 768]
     # Not every backbone has documented MRL support, so there is no set for all five.
     assert backbones.shared_mrl_dims() == []
 
@@ -193,65 +208,76 @@ def test_mrl_claims_cite_a_source(backbone):
 
 
 def test_backbones_without_documented_mrl():
-    """Checked 15.09.2026; truncation is a naive baseline for these three."""
+    """Checked 15.09.2026; truncation is below a naive baseline for these two."""
     no_mrl = {b.key for b in backbones.all_backbones() if not b.mrl_dims}
-    assert no_mrl == {"lfm25", "harrier-270m", "harrier-06b"}
+    assert no_mrl == {"harrier-270m", "harrier-06b"}
 
 
 @pytest.mark.parametrize("backbone", backbones.all_backbones(), ids=lambda b: b.key)
 def test_every_backbone_has_an_environment(backbone):
-    assert backbone.transformers_majors
-    for major in backbone.transformers_majors:
-        assert major in backbones.ENVIRONMENTS, (
-            f"{backbone.key} claims transformers {major}.x, which no environment provides"
-        )
+    assert backbones.environments_for(backbone), (
+        f"{backbone.key} claims transformers {backbone.transformers_majors} with "
+        f"sentence-transformers {backbone.sentence_transformers_majors}, which no "
+        "environment provides"
+    )
 
 
-def test_the_environment_split_is_exactly_mgte_and_mdenseon():
+def test_the_environment_split():
     """If this ever fails, the split has changed and envs/README.md is stale."""
     assert backbones.get("mgte").transformers_majors == (4,)
     assert backbones.get("mdenseon").transformers_majors == (5,)
-    assert {b.key for b in backbones.runnable_backbones(4)} == {
-        "mgte", "lfm25", "harrier-270m", "harrier-06b"
+    assert backbones.get("embeddinggemma-2").sentence_transformers_majors == (6,)
+    assert {b.key for b in backbones.runnable_backbones(4, 5)} == {
+        "mgte", "harrier-270m", "harrier-06b"
     }
-    assert {b.key for b in backbones.runnable_backbones(5)} == {
-        "mdenseon", "lfm25", "harrier-270m", "harrier-06b"
+    assert {b.key for b in backbones.runnable_backbones(5, 5)} == {
+        "mdenseon", "harrier-270m", "harrier-06b"
     }
+    assert {b.key for b in backbones.runnable_backbones(5, 6)} == {"embeddinggemma-2"}
+
+
+def test_only_embeddinggemma_needs_sentence_transformers_6():
+    """The supervisor's <6.0 ceiling holds for every other model."""
+    for backbone in backbones.all_backbones():
+        if backbone.key != "embeddinggemma-2":
+            assert backbone.sentence_transformers_majors == (5,)
 
 
 def test_no_single_environment_runs_every_backbone():
-    """The claim the second environment exists for. Stated as a test so that an
+    """The claim the extra environments exist for. Stated as a test so that an
     upstream fix making it false shows up as a failure to celebrate."""
-    for major in backbones.ENVIRONMENTS:
-        assert len(backbones.runnable_backbones(major)) < len(backbones.all_backbones())
+    for major, st_major in backbones.ENVIRONMENTS:
+        assert len(backbones.runnable_backbones(major, st_major)) < len(backbones.all_backbones())
 
 
 def test_require_runnable_names_the_fix():
     with pytest.raises(RuntimeError, match="envs/transformers5"):
-        backbones.require_runnable(backbones.get("mdenseon"), major=4)
+        backbones.require_runnable(backbones.get("mdenseon"), major=4, st_major=5)
     with pytest.raises(RuntimeError, match="uv sync"):
-        backbones.require_runnable(backbones.get("mgte"), major=5)
+        backbones.require_runnable(backbones.get("mgte"), major=5, st_major=5)
+    with pytest.raises(RuntimeError, match="envs/sentence_transformers6"):
+        backbones.require_runnable(backbones.get("embeddinggemma-2"), major=5, st_major=5)
     # A backbone in the right environment passes silently.
-    backbones.require_runnable(backbones.get("lfm25"), major=4)
-    backbones.require_runnable(backbones.get("lfm25"), major=5)
+    backbones.require_runnable(backbones.get("harrier-270m"), major=4, st_major=5)
+    backbones.require_runnable(backbones.get("harrier-270m"), major=5, st_major=5)
 
 
 def test_prompt_name_keys_fragment_the_cache_where_prompted_text_does_not():
     """Why the cache key is `sha256(prompted_text)` and not `(prompt_name, text)`.
 
-    The reference `CachedEncoder` keys on the prompt *name*. LFM2.5 declares eight
-    names -- `document`, `positive`, `negative_0..6` -- that all resolve to the same
-    `"document: "` prefix, because they are the role names from its training script.
-    Name-keying therefore stores up to eight identical vectors for one document and
-    misses the cache seven times out of eight; hashing the prompted text collapses
-    them to one entry. That is a throughput argument on top of the correctness
-    argument in the test above, and it points the same way.
+    The reference `CachedEncoder` keys on the prompt *name*. EmbeddingGemma-2
+    declares three names -- `document`, `Document`, `Retrieval-document` -- that
+    all resolve to the same `"title: none | text: "` prefix (LFM2.5 did the same
+    with eight training-time role names). Name-keying therefore stores several
+    identical vectors for one document and misses the cache on every alias but
+    one; hashing the prompted text collapses them to one entry. That is a
+    throughput argument on top of the correctness argument in the test above, and
+    it points the same way.
     """
-    lfm = backbones.get("lfm25")
-    document_prefix = lfm.prompt_for("document")
-    aliases = [n for n, p in (lfm.prompts or {}).items() if p == document_prefix]
-    assert len(aliases) > 1, "expected LFM2.5's training-time role aliases"
-    assert {"document", "positive"} <= set(aliases)
+    gemma = backbones.get("embeddinggemma-2")
+    document_prefix = gemma.prompt_for("document")
+    aliases = [n for n, p in (gemma.prompts or {}).items() if p == document_prefix]
+    assert set(aliases) == {"document", "Document", "Retrieval-document"}
 
     text = "Paris is the capital of France."
     by_name = {(name, text) for name in aliases}
@@ -284,7 +310,7 @@ def test_probe_does_not_silently_become_the_documented_claim():
     NanoBEIR queries' worth of evidence is not a training-recipe citation, and the
     write-up has to keep the two apart.
     """
-    for key in ("lfm25", "harrier-270m", "harrier-06b"):
+    for key in ("harrier-270m", "harrier-06b"):
         b = backbones.get(key)
         assert b.mrl_probe, f"{key} should have been probed"
         assert b.mrl_dims is None
@@ -305,13 +331,36 @@ def test_the_two_known_mrl_models_are_the_controls():
         assert b.mrl_probe, f"control {key} was never run through the probe"
 
 
+DEDICATED_PROMPT_NAMES = {
+    "STS": ("sts", "sentencesimilarity"),
+    "Classification": ("classification",),
+    "Clustering": ("clustering",),
+}
+"""How a declared prompt name identifies the symmetric task type it is for."""
+
+
 @pytest.mark.parametrize("backbone", list(backbones.BACKBONES.values()), ids=lambda b: b.key)
-def test_symmetric_prompt_follows_the_sts_rule(backbone):
-    """Dedicated STS prompt if the model declares one, else the query prompt
-    (Andrianos, 06.10.2026). Never chosen per model by score."""
-    dedicated = [name for name in (backbone.prompts or {}) if "sts" in name.lower()]
+@pytest.mark.parametrize("task_type", sorted(DEDICATED_PROMPT_NAMES))
+def test_symmetric_prompt_follows_the_task_prompt_rule(backbone, task_type):
+    """Dedicated prompt for the task type if the model declares one, else the query
+    prompt (Andrianos, 06.10.2026, for STS; per type since 07.10.2026). Never
+    chosen per model by score."""
+    markers = DEDICATED_PROMPT_NAMES[task_type]
+    dedicated = [
+        name for name in (backbone.prompts or {})
+        if any(marker in name.lower().replace("-", "").replace("_", "") for marker in markers)
+        and not name.lower().startswith(("pair", "multilabel"))
+    ]
     if dedicated:
-        assert backbone.symmetric_prompt_name in dedicated
+        assert backbone.task_prompt_names.get(task_type) in dedicated
     else:
-        assert backbone.symmetric_prompt_name is None
-        assert backbone.prompt_for("symmetric") == backbone.prompt_for("query")
+        assert task_type not in backbone.task_prompt_names
+        assert backbone.prompt_for("symmetric", task_type) == backbone.prompt_for("query")
+
+
+def test_harrier_classification_does_not_get_the_sts_instruction():
+    """The bug the per-type rule fixes: one symmetric prompt for every task type."""
+    harrier = backbones.get("harrier-270m")
+    assert harrier.prompt_for("symmetric", "STS").startswith("Instruct: Retrieve semantically")
+    assert harrier.prompt_for("symmetric", "Classification") == harrier.prompt_for("query")
+    assert harrier.prompt_for("symmetric", "Clustering") == harrier.prompt_for("query")

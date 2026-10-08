@@ -7,21 +7,25 @@ model set, the version rationale, and the work-package sequence.
 ## Quick start
 
 ```bash
-uv sync                                 # root environment: transformers 4.x
-uv sync --project envs/transformers5    # second environment: transformers 5.x
-cp .env.example .env                    # PROJECT_ROOT is required
+uv sync                                         # root: transformers 4.x
+uv sync --project envs/transformers5            # transformers 5.x
+uv sync --project envs/sentence_transformers6   # sentence-transformers 6.x
+cp .env.example .env                            # PROJECT_ROOT is required
 uv run python scripts/smoke_backbones.py
 uv run --project envs/transformers5 python scripts/smoke_backbones.py
+uv run --project envs/sentence_transformers6 python scripts/smoke_backbones.py
 ```
 
-**There are two environments and there is no way around it.** mGTE runs only on
-`transformers` 4.x, mDenseOn only on 5.x; both established by loading the models. Ask
+**There are three environments and there is no way around it.** mGTE runs only on
+`transformers` 4.x, mDenseOn only on 5.x, EmbeddingGemma-2 only on
+`sentence-transformers` 6.x; all established by loading the models. Ask
 `backbones.runnable_backbones()` rather than assuming, and call
 `backbones.require_runnable(backbone)` before any load — the native failures are an
-`Unrecognized processing class` and an `IndexError` with a nonsense index inside
-`forward`, neither of which names the real problem. Only precomputation is affected:
-the cache holds plain fp32 arrays, so everything downstream runs in one environment.
-See `envs/README.md`.
+`Unrecognized processing class`, an `IndexError` with a nonsense index inside
+`forward`, and a missing `sentence_transformers.base.modules.normalize`, none of which
+names the real problem. Only precomputation is affected: the cache holds plain fp32
+arrays and its `meta.json`, so evaluation runs in the root environment with no model
+loaded (`cache.resolve_encode_config`). See `envs/README.md`.
 
 This is a real installed package. Imports are absolute (`from geopres_grid.config
 import ...`) and there is no `PYTHONPATH` to set — unlike the upstream GeoPres repo,
@@ -33,7 +37,10 @@ which used bare imports plus `PYTHONPATH=geopres`.
   `lightonai/mDenseOn` declares its modules under
   `sentence_transformers.base.modules.*`, which does not exist before 5.4. The ceiling
   is supervisor guidance — 6.x introduces new bugs and compatibility issues. Do not
-  raise it without retesting the whole model set.
+  raise it without retesting the whole model set. The one exception is
+  `envs/sentence_transformers6`, which overrides it for `google/embeddinggemma-2`
+  alone (`>=6.1.0`, with `transformers>=5.19.0`, the first release that has the
+  model type).
 - `transformers==4.56.0`, `tokenizers>=0.22.0,<=0.23.0`,
   `huggingface-hub>=0.34.0,<1.0` — the combination the supervisor tested, verified
   here on 4 of 5 backbones. Staying on the 4.x line also keeps
@@ -65,7 +72,12 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   exists. Provenance that does not change the meaning of an embedding belongs in the
   recorded-only block, not in the hash.
 - **Never hard-code a device.** Use `config.resolve_device()`. Evaluation must run
-  on CPU; only precomputation needs a GPU.
+  on CPU with no model loaded; only precomputation needs a GPU. Non-retrieval tasks
+  are precomputed by a baseline pass through MTEB on the GPU node
+  (`evaluation.baseline_pass`), because what they encode depends on MTEB's sampling.
+- **One `max_seq_length` for everything: `PRIMARY_MAX_SEQ_LENGTH = 8192`**, the
+  smallest documented `context_window`. Never leave it unset: harrier and
+  EmbeddingGemma-2 declare none and fall back to their tokenizer's limit.
 - **Large artefacts never enter the repo.** Everything goes under `$STORAGE_PATH`.
 - **`WP-x seam` comments mark deliberate temporary code.** They point at the layout
   or convention a later work package replaces. Do not "clean them up" — update the
@@ -80,7 +92,7 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   modelling code from `Alibaba-NLP/new-impl`, a separate unpinned repo. Anything
   claiming reproducibility from the registry sha alone is overclaiming.
 - **MTEB's `CachedEmbeddingWrapper` keys on `sha256(text)` scoped by task name
-  only** — no split, no subset, no prompt type. Three of the five backbones use
+  only** — no split, no subset, no prompt type. Four of the five backbones use
   asymmetric prompts, so a query and a document with the same text collide. Do not
   use it unmodified.
 - **MTEB's `CompressionWrapper` refits min/max inside every `encode` call**, so
@@ -91,8 +103,15 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   `get_embedding_dimension`; the old name works but emits a `FutureWarning`. Prefer
   the new name with a `getattr` fallback. Relevant to work package D, which
   overrides it on the reduced model.
-- **Three of five stacks end in `Normalize`, two do not.** Never append a projection
-  to the module stack and assume a consistent input geometry.
+- **Four of five stacks end in `Normalize`, mDenseOn's does not.** Never append a
+  projection to the module stack and assume a consistent input geometry.
+- **`transformers` 5.x loads in `dtype="auto"`.** A bf16 checkpoint (EmbeddingGemma-2)
+  then runs in bf16 unless `model_kwargs={"dtype": "float32"}` is passed — which every
+  load in this repo does. EmbeddingGemma-2 must never run in fp16.
+- **Symmetric tasks pick their prompt by MTEB task type** (`Backbone.task_prompt_names`):
+  a dedicated prompt for STS / classification / clustering if the model declares
+  one, else the query prompt. One prompt for every symmetric task gave harrier's
+  STS instruction to classifiers.
 - **Silence in a model card is not evidence.** mGTE and mDenseOn were called non-MRL
   on the basis of silent cards; both are MRL-trained per their papers. Every backbone
   now carries `mrl_checked` plus a source for the claim in either direction, and
