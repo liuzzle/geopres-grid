@@ -15,14 +15,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from geopres_grid.evaluation import task_names
+from geopres_grid.evaluation import TIER_TASKS, task_names
 from geopres_grid.results import comparison_table, load_results, load_upstream_results
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-root", type=Path, help="default: $EVALUATION_RESULTS_PATH")
-    parser.add_argument("--tier", choices=["tier0", "tier1", "tier2"], help="Restrict the wide table to one tier's tasks")
+    parser.add_argument("--tier", choices=sorted(TIER_TASKS), help="Restrict the wide table to one tier's tasks")
     parser.add_argument("--metric", action="append", default=[], help="Extra metric column for the tidy table, e.g. recall_at_100")
     parser.add_argument("--upstream", type=Path, help="Upstream GeoPres evaluation_results directory")
     args = parser.parse_args(argv)

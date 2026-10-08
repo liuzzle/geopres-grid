@@ -5,7 +5,13 @@ import pytest
 from geopres_grid.backbones import get
 from geopres_grid.cache import CachedBackbone
 from geopres_grid.evaluation import BEIR_TASKS
+from geopres_grid.evaluation import MLDR_TASKS
 from geopres_grid.evaluation import NANOBEIR_TASKS
+from geopres_grid.evaluation import NON_RETRIEVAL_TASKS
+from geopres_grid.evaluation import TASK_EVAL_SPLITS
+from geopres_grid.evaluation import TIER_TASKS
+from geopres_grid.evaluation import baseline_pass
+from geopres_grid.evaluation import load_tasks
 from geopres_grid.evaluation import PostProcessedBackbone
 from geopres_grid.evaluation import cached_blocks
 from geopres_grid.evaluation import evaluate_cell
@@ -35,10 +41,50 @@ def test_tier_two_is_full_beir():
     assert BEIR_TASKS == benchmark_tasks("BEIR")
 
 
-@pytest.mark.parametrize("tier", ["tier0", "tier1", "tier2"])
+UPSTREAM_NON_RETRIEVAL = {
+    "STS": {"STS12", "STS13", "STS14", "STS15", "STS16", "STSBenchmark", "SICK-R"},
+    "Classification": {
+        "AmazonCounterfactualClassification", "AmazonReviewsClassification",
+        "ImdbClassification", "ToxicConversationsClassification",
+        "AmazonPolarityClassification",
+    },
+    "Clustering": {"ArxivClusteringS2S", "RedditClustering", "StackExchangeClustering"},
+}
+"""Upstream GeoPres `eval_utils.py`, verbatim."""
+
+
+def test_non_retrieval_set_is_upstreams():
+    """Andrianos, 07.10.2026: add Konstantinos' non-retrieval set -- under his task
+    names, not mteb's `.v2` successors, so the definitions match his."""
+    assert task_names("nonretrieval") == NON_RETRIEVAL_TASKS
+    assert set(NON_RETRIEVAL_TASKS) == set().union(*UPSTREAM_NON_RETRIEVAL.values())
+    for task in load_tasks(NON_RETRIEVAL_TASKS):
+        assert task.metadata.name in UPSTREAM_NON_RETRIEVAL[task.metadata.type]
+
+
+def test_mldr_is_its_own_set():
+    assert task_names("mldr") == MLDR_TASKS == ("MultiLongDocRetrieval",)
+
+
+@pytest.mark.parametrize("tier", sorted(TIER_TASKS))
 def test_every_tier_task_resolves_in_the_pinned_mteb(tier):
     names = task_names(tier)
-    assert tuple(task.metadata.name for task in mteb.get_tasks(tasks=list(names))) == names
+    assert tuple(task.metadata.name for task in load_tasks(names)) == names
+
+
+def test_split_overrides_reach_the_task_and_keep_every_language():
+    """`test` only, as upstream scored them; no languages filter, as upstream ran."""
+    tasks = {task.metadata.name: task for task in load_tasks(TASK_EVAL_SPLITS)}
+    for name, splits in TASK_EVAL_SPLITS.items():
+        assert tuple(tasks[name].eval_splits) == splits
+    assert set(tasks["AmazonCounterfactualClassification"].hf_subsets) == {"en", "en-ext", "de", "ja"}
+    assert len(tasks["MultiLongDocRetrieval"].hf_subsets) == 13
+
+
+def test_tasks_without_an_override_keep_their_declared_splits():
+    nano, msmarco = load_tasks(["NanoArguAnaRetrieval", "MSMARCO"])
+    assert nano.eval_splits == ["train"]
+    assert msmarco.eval_splits == ["dev"]
 
 
 def test_sample_rows_is_seeded_bounded_and_spans_blocks():
@@ -183,6 +229,19 @@ def test_an_identity_cell_is_not_scored_twice(tmp_path, monkeypatch, config):
     assert baseline == scored == "scores"
     records = list((tmp_path / "results").rglob("*.json"))
     assert [record.stem for record in records] == [cell.cached.encode_config.hash]
+
+
+def test_the_precompute_baseline_pass_cannot_be_skipped(tmp_path, monkeypatch):
+    """With `only-missing`, an existing result would skip the encode and leave the
+    cache cold; precompute passes `always`."""
+    seen = {}
+    monkeypatch.setattr(mteb, "evaluate", lambda model, task, **kwargs: seen.update(kwargs) or "scores")
+    cached = make_cached(tmp_path / "cache")
+
+    baseline_pass(cached, object(), results_cache=FakeResultCache(tmp_path / "results"), overwrite_strategy="always")
+
+    assert seen["overwrite_strategy"] == "always"
+    assert [record.stem for record in (tmp_path / "results").rglob("*.json")] == [cached.encode_config.hash]
 
 
 def test_a_reducing_or_quantizing_cell_is_not_identity():

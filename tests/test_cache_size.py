@@ -63,3 +63,35 @@ def test_estimate_task_reads_the_v2_layout_of_standard_retrieval_tasks():
     assert result["documents"] == 5
     assert result["queries"] == 2
     assert result["total_bytes"] == 7 * 4 * 4
+
+
+class FakeRows(list):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.column_names = list(rows[0]) if rows else []
+
+
+def test_estimate_task_counts_both_sentences_of_an_sts_pair():
+    task = SimpleNamespace(
+        name="FakeSTS",
+        metadata=SimpleNamespace(name="FakeSTS", eval_splits=["test"], type="STS"),
+        dataset={"default": {"test": FakeRows([{"sentence1": "a", "sentence2": "b", "score": 1.0}] * 3)}},
+    )
+    backbone = SimpleNamespace(key="fake", native_dim=4)
+
+    result = estimate_task(task, backbone)
+
+    assert (result["documents"], result["queries"]) == (0, 6)
+    assert result["total_bytes"] == 6 * 4 * 4
+
+
+def test_estimate_task_counts_legacy_clustering_sentences_across_subsets():
+    rows = FakeRows([{"sentences": ["a", "b", "c"], "labels": [0, 1, 0]}, {"sentences": ["d"], "labels": [1]}])
+    task = SimpleNamespace(
+        name="FakeClustering",
+        metadata=SimpleNamespace(name="FakeClustering", eval_splits=["test"], type="Clustering"),
+        dataset={"en": {"test": rows}, "de": {"test": rows}},
+    )
+    backbone = SimpleNamespace(key="fake", native_dim=1)
+
+    assert estimate_task(task, backbone)["queries"] == 8

@@ -24,7 +24,7 @@ from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
 from geopres_grid.reducers import PostProcessingPipeline
 from geopres_grid.results import write_run_record
 
-Tier = Literal["tier0", "tier1", "tier2"]
+Tier = Literal["tier0", "tier1", "tier2", "nonretrieval", "mldr"]
 
 NANOBEIR_TASKS: tuple[str, ...] = (
     "NanoArguAnaRetrieval",
@@ -65,16 +65,73 @@ BEIR_TASKS: tuple[str, ...] = (
 a strict and mostly expensive subset, with these. MSMARCO is scored on its
 declared `dev` split; nothing here overrides `eval_splits`."""
 
+NON_RETRIEVAL_TASKS: tuple[str, ...] = (
+    "STS12",
+    "STS13",
+    "STS14",
+    "STS15",
+    "STS16",
+    "STSBenchmark",
+    "SICK-R",
+    "AmazonCounterfactualClassification",
+    "AmazonReviewsClassification",
+    "ImdbClassification",
+    "ToxicConversationsClassification",
+    "AmazonPolarityClassification",
+    "ArxivClusteringS2S",
+    "RedditClustering",
+    "StackExchangeClustering",
+)
+"""Konstantinos' non-retrieval set from upstream GeoPres (`eval_utils.py`), under
+the same names -- not the `.v2` or hierarchical successors mteb 2.15.1 points to,
+so the task definitions match upstream's. Seven STS, five classification, three
+clustering. Added 07.10.2026 (Andrianos, answering 06.10 §7)."""
+
+MLDR_TASKS: tuple[str, ...] = ("MultiLongDocRetrieval",)
+"""MLDR (Chen et al., arXiv:2402.03216), thirteen languages of long documents.
+Added 07.10.2026; at 512 tokens it measured truncation, so it waited on LFM2.5
+leaving and `PRIMARY_MAX_SEQ_LENGTH` rising to 8192."""
+
 TIER_TASKS: dict[Tier, tuple[str, ...]] = {
     "tier0": ("NanoArguAnaRetrieval", "STSBenchmark"),
     "tier1": NANOBEIR_TASKS,
     "tier2": BEIR_TASKS,
+    "nonretrieval": NON_RETRIEVAL_TASKS,
+    "mldr": MLDR_TASKS,
 }
+"""Task sets by cost. Tiers 0-2 grow by orders of magnitude and run on fewer
+grid cells as they grow; `nonretrieval` and `mldr` are supplementary sets
+beside tier 2 -- the first cheap, the second long-context."""
+
+TASK_EVAL_SPLITS: dict[str, tuple[str, ...]] = {
+    "AmazonCounterfactualClassification": ("test",),
+    "AmazonReviewsClassification": ("test",),
+    "MultiLongDocRetrieval": ("test",),
+}
+"""Overrides of a task's declared `eval_splits`, for the tasks that also declare
+a validation/dev split. Upstream GeoPres scored every non-retrieval task on `test`
+only; MLDR follows BEIR's convention of `test`. Every other task keeps its own
+declaration -- NanoBEIR's only split is `train`, MSMARCO's is `dev`. All language
+subsets are kept, as upstream did (no `languages` filter)."""
 
 
 def task_names(tier: Tier) -> tuple[str, ...]:
     """Return the immutable task list for one evaluation tier."""
     return TIER_TASKS[tier]
+
+
+def load_tasks(names: Any) -> list[Any]:
+    """MTEB task objects for `names`, with `TASK_EVAL_SPLITS` applied.
+
+    Every entry point goes through this, so precompute, evaluation and the cache
+    estimate agree on which splits exist.
+    """
+    import mteb
+
+    return [
+        mteb.get_task(name, eval_splits=list(TASK_EVAL_SPLITS[name]) if name in TASK_EVAL_SPLITS else None)
+        for name in names
+    ]
 
 
 # --- calibration ---------------------------------------------------------------
@@ -286,6 +343,37 @@ def run_record(cached: CachedBackbone, config: PostProcConfig | None) -> dict[st
     }
 
 
+def baseline_pass(
+    cached: CachedBackbone,
+    task: Any,
+    *,
+    results_cache: Any = None,
+    encode_kwargs: dict[str, Any] | None = None,
+    overwrite_strategy: str = "only-missing",
+) -> Any:
+    """Score one task through the plain cache wrapper: the backbone's fp32 baseline,
+    stored under the encode hash with its run record.
+
+    On a GPU node with a model loaded, this is how non-retrieval tasks are
+    precomputed -- what STS, classification and clustering encode depends on
+    MTEB's own sampling, so letting MTEB drive the wrapper is the only way to
+    cache exactly the inputs evaluation will ask for. Precompute passes
+    `overwrite_strategy="always"`, so an existing result cannot skip the encode
+    and leave the cache cold.
+    """
+    import mteb
+
+    cache = results_cache if results_cache is not None else mteb.ResultCache()
+    write_run_record(cache.cache_path, run_record(cached, None))
+    return mteb.evaluate(
+        cached,
+        task,
+        cache=cache,
+        encode_kwargs=encode_kwargs,
+        overwrite_strategy=overwrite_strategy,
+    )
+
+
 def evaluate_cell(
     cell: PostProcessedBackbone,
     task: Any,
@@ -295,8 +383,10 @@ def evaluate_cell(
 ) -> tuple[Any, Any]:
     """Warm up, calibrate and score one task for one grid cell.
 
-    1. Warm-up pass through the plain cache wrapper. It fills the embedding cache
-       and is the fp32 baseline of this backbone, stored under the encode hash.
+    1. Warm-up pass through the plain cache wrapper (`baseline_pass`). It is the
+       fp32 baseline of this backbone, stored under the encode hash; on a warm
+       cache it reads only cached vectors, and when precompute already scored it,
+       MTEB returns the stored result without encoding at all.
     2. Fit on each leaf task's cached inputs (Kisako et al. §3.5).
     3. Score the cell, stored under the run id.
     Each result slot gets its run record in `runs/` beside MTEB's `results/`.
@@ -308,9 +398,7 @@ def evaluate_cell(
     import mteb
 
     cache = results_cache if results_cache is not None else mteb.ResultCache()
-    kwargs = {"cache": cache}
-    write_run_record(cache.cache_path, run_record(cell.cached, None))
-    baseline = mteb.evaluate(cell.cached, task, encode_kwargs=encode_kwargs, **kwargs)
+    baseline = baseline_pass(cell.cached, task, results_cache=cache, encode_kwargs=encode_kwargs)
     if cell.config.is_identity:
         return baseline, baseline
     for leaf in leaf_tasks(task):
@@ -321,5 +409,5 @@ def evaluate_cell(
         )
         cell.fit_task(leaf.metadata.name, blocks)
     write_run_record(cache.cache_path, run_record(cell.cached, cell.config))
-    scored = mteb.evaluate(cell, task, encode_kwargs=encode_kwargs, **kwargs)
+    scored = mteb.evaluate(cell, task, cache=cache, encode_kwargs=encode_kwargs)
     return baseline, scored
