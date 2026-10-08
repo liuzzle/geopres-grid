@@ -10,13 +10,16 @@ through its deprecation shim onto the same new classes, so they keep working.
 Everything here runs on CPU. No GPU is needed to establish that the model set loads.
 
     uv run python scripts/smoke_backbones.py
-    uv run python scripts/smoke_backbones.py --models mdenseon lfm25
+    uv run python scripts/smoke_backbones.py --models mgte harrier-270m
 
-Backbones that cannot run under the installed `transformers` major are skipped with
-the command that would run them, rather than counted as failures -- the model set
-is split across two environments on purpose (see `envs/README.md`).
+Backbones that cannot run under the installed `transformers` / `sentence-transformers`
+majors are skipped with the command that would run them, rather than counted as
+failures -- the model set is split across three environments on purpose (see
+`envs/README.md`). EmbeddingGemma-2 is the exception to the paragraph above: its
+`modules.json` names a 6.x-only module path, hence the third environment.
 
     uv run --project envs/transformers5 python scripts/smoke_backbones.py
+    uv run --project envs/sentence_transformers6 python scripts/smoke_backbones.py
 """
 
 import argparse
@@ -55,11 +58,16 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
     """Load one backbone, verify the registry against it, and encode one sentence."""
     started = time.perf_counter()
 
+    # float32 explicitly, as precompute loads it. transformers 5.x defaults to
+    # dtype="auto", so a bf16 checkpoint (EmbeddingGemma-2) would otherwise load
+    # in bf16 and miss the unit-norm check below by 3e-3 -- testing a different
+    # encode path from the one that fills the cache.
     model = SentenceTransformer(
         backbone.model_id,
         revision=backbone.revision,
         trust_remote_code=backbone.trust_remote_code,
         device="cpu",
+        model_kwargs={"dtype": "float32"},
     )
     load_seconds = time.perf_counter() - started
 
@@ -90,6 +98,19 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
         check(
             prompts == backbone.prompts,
             f"prompt mismatch:\n  registry: {backbone.prompts!r}\n  model:    {prompts!r}",
+        )
+
+    # Evaluation scores warm caches with `cache.cosine_similarity`, never the model's
+    # own similarity, so a backbone that declared anything else would be mis-scored.
+    check(
+        getattr(model, "similarity_fn_name", None) in (None, "cosine"),
+        f"model declares similarity {model.similarity_fn_name!r}; evaluation assumes cosine",
+    )
+    for task_type, name in backbone.task_prompt_names.items():
+        check(
+            name in (model.prompts or {}),
+            f"registry uses prompt_name={name!r} for {task_type}, but the loaded model "
+            f"declares {sorted(model.prompts or {})}",
         )
 
     # The per-side names are what encode() is actually called with, so a name the
@@ -146,7 +167,7 @@ def probe(backbone: backbones.Backbone, max_seq_length: int | None) -> dict:
         model_id=backbone.model_id,
         revision=backbone.revision,
         device="cpu",
-        symmetric_prompt_name=backbone.symmetric_prompt_name,
+        task_prompt_names=backbone.task_prompt_names,
     )
 
     del model
@@ -188,8 +209,10 @@ def main() -> int:
     max_seq_length = args.max_seq_length or None
 
     major = backbones.installed_transformers_major()
-    runnable = [b for b in selected if major in b.transformers_majors]
-    skipped = [b for b in selected if major not in b.transformers_majors]
+    st_major = backbones.installed_sentence_transformers_major()
+    here = backbones.runnable_backbones(major, st_major)
+    runnable = [b for b in selected if b in here]
+    skipped = [b for b in selected if b not in here]
 
     print(f"sentence-transformers {__import__('sentence_transformers').__version__}")
     print(f"transformers          {__import__('transformers').__version__}")
@@ -200,8 +223,7 @@ def main() -> int:
         print("skipped -- wrong environment for these:")
         for backbone in skipped:
             wants = ", ".join(
-                backbones.ENVIRONMENTS.get(m, f"transformers {m}.x")
-                for m in backbone.transformers_majors
+                backbones.ENVIRONMENTS[key] for key in backbones.environments_for(backbone)
             )
             print(f"  {backbone.key:<14} needs {wants}")
         print()
@@ -247,8 +269,8 @@ def main() -> int:
 
     tail = f" ({len(skipped)} skipped: other environment)" if skipped else ""
     print(
-        f"All {len(runnable)} backbones runnable on transformers {major}.x "
-        f"load and encode on CPU.{tail}"
+        f"All {len(runnable)} backbones runnable on transformers {major}.x / "
+        f"sentence-transformers {st_major}.x load and encode on CPU.{tail}"
     )
     return 0
 
