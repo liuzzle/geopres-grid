@@ -8,18 +8,23 @@ three work packages later.
 
 Two fields exist because of findings in the smoke test:
 
-  `normalizes` -- three of the five stacks end in a `Normalize` module and two do
-  not. Appending a projection after the stack therefore means "project unit
-  vectors, return unnormalised" for some models and "project raw pooled vectors"
-  for others. WP-D removes the ambiguity by caching pre-`Normalize` vectors and
-  applying `normalize -> reduce -> normalize` explicitly; this flag is what lets
-  the cache layer know what it is looking at.
+  `normalizes` -- four of the five stacks end in a `Normalize` module and
+  mDenseOn's does not. Appending a projection after the stack therefore means
+  "project unit vectors, return unnormalised" for some models and "project raw
+  pooled vectors" for others. WP-D removes the ambiguity by caching
+  pre-`Normalize` vectors and applying `normalize -> reduce -> normalize`
+  explicitly; this flag is what lets the cache layer know what it is looking at.
 
-  `prompts` -- three of the five use asymmetric query/document prompts. MTEB's
+  `prompts` -- four of the five use asymmetric query/document prompts. MTEB's
   own `CachedEmbeddingWrapper` keys its cache on `sha256(text)` alone, so for
   these models a query and a document with identical text collide. WP-C keys on
   the *prompted* text and scopes by `prompt_type`; this field is the list of
   models for which that matters.
+
+The set changed on 07.10.2026 (Andrianos, answering the 06.10 notes):
+`LiquidAI/LFM2.5-Embedding-350M` was dropped -- its 512-token ceiling kept MLDR
+out and capped every other model's context -- and `google/embeddinggemma-2` was
+added. LFM2.5's probe results and prompt findings stay in `logging.md`.
 """
 
 from dataclasses import dataclass, field
@@ -44,10 +49,16 @@ class Backbone:
     native_max_seq_length: int | None
     """`max_seq_length` the model ships with, or None when it declares none.
 
-    None means the model has no `sentence_bert_config.json` and sentence-transformers
-    falls back to the tokenizer's `model_max_length`, which is not a deliberate
-    choice by the model author. Both harrier checkpoints are in this position.
+    None means the model declares none, and sentence-transformers falls back to the
+    tokenizer's `model_max_length`, which is not a deliberate choice by the model
+    author. Both harrier checkpoints ship no `sentence_bert_config.json`;
+    EmbeddingGemma-2 ships one without the key and its tokenizer says 1e30.
     """
+
+    context_window: int
+    """Documented context window in tokens, from the model card or paper -- the
+    ceiling for `max_seq_length`, which `native_max_seq_length` is not where that
+    is None. `PRIMARY_MAX_SEQ_LENGTH` must not exceed any of these."""
 
     normalizes: bool
     """Whether the ST module stack ends in a `Normalize` module."""
@@ -59,11 +70,20 @@ class Backbone:
     """Major `transformers` versions this model actually runs on.
 
     Not a guess from metadata -- every entry here was established by loading the
-    model and encoding with it. Two of the five are single-major: mGTE only works
-    on 4.x (on 5.x it loads and then dies inside `forward`, see its notes) and
-    mDenseOn only on 5.x (its tokenizer class does not exist before 5.0). There is
-    therefore no single environment that runs the whole model set; see
-    `ENVIRONMENTS` below.
+    model and encoding with it. Three of the five are single-major: mGTE only works
+    on 4.x (on 5.x it loads and then dies inside `forward`, see its notes),
+    mDenseOn and EmbeddingGemma-2 only on 5.x. There is therefore no single
+    environment that runs the whole model set; see `ENVIRONMENTS` below.
+    """
+
+    sentence_transformers_majors: tuple[int, ...] = (5,)
+    """Major `sentence-transformers` versions this model actually runs on.
+
+    5.x is the project pin and the supervisor's ceiling. EmbeddingGemma-2 is the
+    one exception: its `modules.json` names `sentence_transformers.base.modules.
+    normalize`, which 5.7 does not have, so it gets its own 6.x environment rather
+    than lifting the ceiling for every model. No other model has been tested on
+    6.x, which is why the default is (5,) and not (5, 6).
     """
 
     prompts: dict[str, str] | None = None
@@ -87,15 +107,19 @@ class Backbone:
     Adding one would be off-distribution for the model.
     """
 
-    symmetric_prompt_name: str | None = None
-    """Key into `prompts` for tasks MTEB encodes without a `prompt_type` (STS), where
-    both texts of a pair go through one side. None falls back to the query prompt.
+    task_prompt_names: dict[str, str] = field(default_factory=dict)
+    """MTEB task type -> key into `prompts`, for the tasks MTEB encodes without a
+    `prompt_type` (STS, Classification, Clustering), where every text goes through
+    one side. A type missing here falls back to the query prompt.
 
-    The rule (Andrianos, 06.10.2026): a model with a dedicated STS prompt uses it;
-    every other model uses its query prompt -- read as "what follows is a short
-    text" -- even where that costs it, because the rule is applied consistently
-    and never tuned per model. Cite the dedicated prompt in `prompt_source`.
-    Mirrored into `EncodeConfig.symmetric_prompt_name`.
+    The rule (Andrianos, 06.10.2026, stated for STS): a model with a dedicated
+    prompt for the task type uses it; every other model uses its query prompt --
+    read as "what follows is a short text" -- even where that costs it, because
+    the rule is applied consistently and never tuned per model. Extended per type
+    on 07.10.2026 when classification and clustering joined the task set: one
+    prompt for all symmetric tasks would have given harrier's "Retrieve
+    semantically similar text" to a sentiment classifier. Cite the dedicated
+    prompts in `prompt_source`. Mirrored into `EncodeConfig.task_prompt_names`.
     """
 
     prompt_source: str = ""
@@ -153,25 +177,26 @@ class Backbone:
         """Whether truncating to `dim` is a documented use of MRL for this model."""
         return bool(self.mrl_dims) and dim in self.mrl_dims
 
-    def prompt_name_for(self, side: str) -> str | None:
+    def prompt_name_for(self, side: str, task_type: str | None = None) -> str | None:
         """Prompt name to pass to `encode` for `side` in ("query", "document",
-        "symmetric"). "symmetric" is a task without a `prompt_type`."""
+        "symmetric"). "symmetric" is a task without a `prompt_type`; its prompt
+        depends on the MTEB `task_type` (`task_prompt_names`)."""
         if side == "query":
             return self.query_prompt_name
         if side == "document":
             return self.document_prompt_name
         if side == "symmetric":
-            return self.symmetric_prompt_name or self.query_prompt_name
+            return self.task_prompt_names.get(task_type or "") or self.query_prompt_name
         raise ValueError(f"side must be 'query', 'document' or 'symmetric', got {side!r}")
 
-    def prompt_for(self, side: str) -> str:
+    def prompt_for(self, side: str, task_type: str | None = None) -> str:
         """The literal prefix prepended to text on `side`. Empty string when bare.
 
         This is the string the cache key has to be built over: WP-C hashes the
         *prompted* text, so `prompt_for(side) + text` is the thing that gets
         hashed, not `text`.
         """
-        name = self.prompt_name_for(side)
+        name = self.prompt_name_for(side, task_type)
         if name is None:
             return ""
         if not self.prompts or name not in self.prompts:
@@ -216,6 +241,7 @@ BACKBONES: dict[str, Backbone] = {
             revision="9bbca17d9273fd0d03d5725c7a4b0f6b45142062",
             native_dim=768,
             native_max_seq_length=8192,
+            context_window=8192,
             normalizes=True,
             trust_remote_code=True,
             prompts=None,
@@ -264,6 +290,7 @@ BACKBONES: dict[str, Backbone] = {
             revision="a5fdb000f7a21da96c3bddde3a782ef777316df3",
             native_dim=768,
             native_max_seq_length=8192,
+            context_window=8192,
             normalizes=False,
             trust_remote_code=False,
             prompts={"query": "query: ", "document": "document: "},
@@ -313,60 +340,13 @@ BACKBONES: dict[str, Backbone] = {
             ),
         ),
         Backbone(
-            key="lfm25",
-            model_id="LiquidAI/LFM2.5-Embedding-350M",
-            revision="f35ae2c91d687658dbf1f2b449382f0b019b9808",
-            native_dim=1024,
-            native_max_seq_length=512,
-            normalizes=False,
-            trust_remote_code=True,
-            prompts={
-                "query": "query: ",
-                "document": "document: ",
-                # Training-time aliases the checkpoint ships; all map to the
-                # document prefix and are recorded so the registry matches the
-                # loaded model exactly.
-                "positive": "document: ",
-                **{f"negative_{i}": "document: " for i in range(7)},
-            },
-            query_prompt_name="query",
-            document_prompt_name="document",
-            prompt_source=(
-                "Model card, 'Encoding queries and documents': 'Always pass "
-                "prompt_name=\"query\" for queries and prompt_name=\"document\" for "
-                "passages -- the model was trained with these prefixes, and omitting "
-                "them silently degrades retrieval quality.' The card's own training "
-                "snippet passes prompts={'query': 'query: ', 'positive': 'document: '}, "
-                "which is where the `positive`/`negative_i` aliases in `prompts` come "
-                "from: they are training-time role names, all resolving to the document "
-                "prefix. Checked 17.09.2026."
-            ),
-            mrl_checked=True,
-            mrl_source=(
-                "No MRL documented. Checked 15.09.2026: HF model card (LiquidAI/LFM2.5-Embedding-350M), the GGUF card, the release blog 'LFM2.5 Retrievers: Bi-directional LFMs for Fast Multilingual Search', and the Liquid docs page. The blog enumerates the full training recipe -- (1) English contrastive pretraining, (2) multilingual/cross-lingual distillation, (3) fine-tuning on hard-mined negatives -- with no nested or Matryoshka objective. No technical report exists. NOTE: web search attributes Matryoshka dims {2048, 1024, 512, 256} to *LFM2.5-230M*, a different (generative) model; it does not transfer to this checkpoint, and 2048 is not even reachable from this model's 1024-d output."
-            ),
-            mrl_probe=(
-                PROBE + "NO PREFIX PRIVILEGE. Truncation is statistically "
-                "indistinguishable from keeping k random columns at every k probed: "
-                "trunc-rand is +0.023 [-0.025, +0.071] at k=32 and within noise of "
-                "zero at 64/128/256, mrl_gain +0.15/-0.04/-0.06/+0.05. Variance in "
-                "the first 32 coordinates is 0.032 against 0.031 for uniform -- flat "
-                "to three decimals, no front-loading at all. So the documented "
-                "negative (mrl_dims=None) is confirmed by measurement rather than "
-                "inferred from silence. Truncating LFM2.5 is a naive baseline; it is "
-                "not, however, actively harmful the way it is on the harriers."
-            ),
-            notes=(
-                "Shortest context of the five at 512 tokens, which is what sets "
-                "PRIMARY_MAX_SEQ_LENGTH below."
-            ),
-        ),
-        Backbone(
             key="harrier-270m",
             model_id="microsoft/harrier-oss-v1-270m",
             revision="31de22b673913c7d658c0f03f792d77c2dcf8ebd",
             native_dim=640,
             native_max_seq_length=None,
+            # Model card, "Max Tokens" column of the harrier-oss-v1 table.
+            context_window=32768,
             normalizes=True,
             trust_remote_code=False,
             prompts={
@@ -379,7 +359,7 @@ BACKBONES: dict[str, Backbone] = {
             },
             query_prompt_name="web_search_query",
             document_prompt_name=None,
-            symmetric_prompt_name="sts_query",
+            task_prompt_names={"STS": "sts_query"},
             prompt_source=(
                 "Model card usage example, which is the only documentation of the "
                 "split: `query_embeddings = model.encode(queries, "
@@ -393,7 +373,9 @@ BACKBONES: dict[str, Backbone] = {
                 "instruction mteb 2.15.1's own harrier implementation "
                 "(`harrier_models.py`, `harrier_task_prompts`) gives STSBenchmark, "
                 "STS12-17 and SICK-R alike; the retrieval prompt was being applied "
-                "there before 06.10.2026."
+                "there before 06.10.2026. Classification and clustering have no "
+                "declared prompt, so they take the query prompt by the same rule; "
+                "mteb's own per-task instructions for them are not in the checkpoint."
             ),
             mrl_checked=True,
             mrl_source=(
@@ -423,6 +405,8 @@ BACKBONES: dict[str, Backbone] = {
             revision="f9b9dc8d367d443f2479d27aa5d8d2850c0774ee",
             native_dim=1024,
             native_max_seq_length=None,
+            # Model card, "Max Tokens" column of the harrier-oss-v1 table.
+            context_window=32768,
             normalizes=True,
             trust_remote_code=False,
             prompts={
@@ -435,7 +419,7 @@ BACKBONES: dict[str, Backbone] = {
             },
             query_prompt_name="web_search_query",
             document_prompt_name=None,
-            symmetric_prompt_name="sts_query",
+            task_prompt_names={"STS": "sts_query"},
             prompt_source=(
                 "Model card usage example, which is the only documentation of the "
                 "split: `query_embeddings = model.encode(queries, "
@@ -449,7 +433,9 @@ BACKBONES: dict[str, Backbone] = {
                 "instruction mteb 2.15.1's own harrier implementation "
                 "(`harrier_models.py`, `harrier_task_prompts`) gives STSBenchmark, "
                 "STS12-17 and SICK-R alike; the retrieval prompt was being applied "
-                "there before 06.10.2026."
+                "there before 06.10.2026. Classification and clustering have no "
+                "declared prompt, so they take the query prompt by the same rule; "
+                "mteb's own per-task instructions for them are not in the checkpoint."
             ),
             mrl_checked=True,
             mrl_source=(
@@ -492,36 +478,126 @@ BACKBONES: dict[str, Backbone] = {
                 "instead of resting on it."
             ),
         ),
+        Backbone(
+            key="embeddinggemma-2",
+            model_id="google/embeddinggemma-2",
+            revision="914f7f89142e33e77833254d9c9b90c3cef7303b",
+            native_dim=768,
+            native_max_seq_length=None,
+            # Model card, "Context Window: 8,192 tokens", shared by all modalities.
+            context_window=8192,
+            normalizes=True,
+            trust_remote_code=False,
+            transformers_majors=(5,),
+            sentence_transformers_majors=(6,),
+            prompts={
+                "BitextMining": "task: search result | query: ",
+                "Classification": "task: classification | query: ",
+                "Clustering": "task: clustering | query: ",
+                "CodeRetrieval": "task: code retrieval | query: ",
+                "Document": "title: none | text: ",
+                "FactChecking": "task: fact checking | query: ",
+                "InstructionRetrieval": "task: code retrieval | query: ",
+                "MultilabelClassification": "task: classification | query: ",
+                "PairClassification": "task: sentence similarity | query: ",
+                "QuestionAnswering": "task: question answering | query: ",
+                "Reranking": "task: search result | query: ",
+                "Retrieval": "task: search result | query: ",
+                "Retrieval-document": "title: none | text: ",
+                "Retrieval-query": "task: search result | query: ",
+                "STS": "task: sentence similarity | query: ",
+                "SearchQuery": "task: search result | query: ",
+                "SentenceSimilarity": "task: sentence similarity | query: ",
+                "Summarization": "task: sentence similarity | query: ",
+                "document": "title: none | text: ",
+                "query": "task: search result | query: ",
+            },
+            query_prompt_name="query",
+            document_prompt_name="document",
+            task_prompt_names={
+                "STS": "STS",
+                "Classification": "Classification",
+                "Clustering": "Clustering",
+            },
+            prompt_source=(
+                "Model card usage example: `model.encode(query, "
+                "prompt_name=\"SearchQuery\")` / `model.encode(document, "
+                "prompt_name=\"Document\")`; `query` and `document` resolve to the "
+                "same two prefixes and are what the other models use. The card's "
+                "prompt table gives the symmetric tasks their own prompts -- "
+                "Classification, Clustering, and SentenceSimilarity (declared as `STS` "
+                "too) -- so all three are dedicated under the task-prompt rule. "
+                "Prefixes read from config_sentence_transformers.json at the pinned "
+                "sha. Checked 07.10.2026."
+            ),
+            mrl_dims=(128, 256, 512, 768),
+            mrl_source=(
+                "Model card, 'Matryoshka Representation Learning (MRL): Native support "
+                "for truncated embeddings across 128d, 256d, 512d, and 768d', with a "
+                "per-dimension MTEB table and the instruction to re-normalise after "
+                "truncating. No paper yet (checked 07.10.2026), so unlike mGTE and "
+                "mDenseOn this is the vendor's card, not a training-recipe citation."
+            ),
+            mrl_checked=True,
+            notes=(
+                "Released 06.10.2026. Multimodal (text, image, video, audio into one "
+                "768-d space); only the text path is used here, but the checkpoint "
+                "carries the vision and audio towers (740M parameters in total). "
+                "Needs transformers >= 5.19 (first release with `embedding_gemma2`) "
+                "and sentence-transformers 6.x: on 5.7 loading fails with "
+                "`No module named sentence_transformers.base.modules.normalize`. It "
+                "runs in `envs/sentence_transformers6`; verified there on 07.10.2026 "
+                "with transformers 5.19.0 and sentence-transformers 6.1.0 (loads, "
+                "768-d, unit norm, cosine). The card forbids float16 -- 'the model "
+                "returns NaN or silently degraded embeddings' -- so precompute in "
+                "float32 or bfloat16 only. Its sentence_bert_config.json declares no "
+                "max_seq_length and the tokenizer reports 1e30, so leaving it unset "
+                "is not an option. Caveat for titled corpora: the card asks for "
+                "`title: {title} | text: {body}`, while MTEB prepares "
+                "`title + ' ' + body` and the prefix says `title: none` -- the same "
+                "prepared text every backbone gets, slightly off this model's format."
+            ),
+        ),
     ]
 }
 
 
-PRIMARY_MAX_SEQ_LENGTH = 512
-"""One `max_seq_length` for every backbone in the primary results.
+PRIMARY_MAX_SEQ_LENGTH = 8192
+"""One `max_seq_length` for every backbone, in every run.
 
-512 is LFM2.5's ceiling and therefore the only value all five can actually reach.
-Fixing it means every model sees the same effective corpus, so a cross-model
-difference is a property of the model rather than of how much text it was allowed
-to read. Native lengths (8192 / 8192 / 512 / tokenizer / tokenizer) are a
-supplementary run, not the headline -- meeting 20.08 §6, "cross-model comparison
-needs a fixed max_seq_length or an explicit caveat".
+8192 is the smallest documented `context_window` of the five (mGTE, mDenseOn and
+EmbeddingGemma-2; the harriers reach 32768), so every model can actually reach it.
+Fixing one value means every model sees the same effective corpus, so a
+cross-model difference is a property of the model rather than of how much text it
+was allowed to read -- meeting 20.08 §6, "cross-model comparison needs a fixed
+max_seq_length or an explicit caveat".
+
+It has to be set, not left to the model: harrier and EmbeddingGemma-2 declare
+none, and sentence-transformers then falls back to the tokenizer's
+`model_max_length` -- 32768 and 1e30, past what EmbeddingGemma-2 was trained on.
+
+Until 07.10.2026 this was 512, LFM2.5's ceiling. Dropping LFM2.5 lifted it, and
+with it the separate native-length run: MLDR, a long-document benchmark that only
+made sense there, now runs at the same length as everything else.
 """
 
 
-ENVIRONMENTS: dict[int, str] = {
-    4: "the project root environment (`uv sync`)",
-    5: "`envs/transformers5` (`uv sync --project envs/transformers5`)",
+ENVIRONMENTS: dict[tuple[int, int], str] = {
+    (4, 5): "the project root environment (`uv sync`)",
+    (5, 5): "`envs/transformers5` (`uv sync --project envs/transformers5`)",
+    (5, 6): "`envs/sentence_transformers6` (`uv sync --project envs/sentence_transformers6`)",
 }
-"""Which environment provides which `transformers` major.
+"""Which environment provides which (`transformers`, `sentence-transformers`) major.
 
-The split is not a preference. mGTE cannot run on 5.x and mDenseOn cannot run on
-4.x, both established by loading them rather than by reading metadata, and neither
-has an upstream fix pending. Three of the five backbones run in either, so the only
-cross-environment cost is that a run covering the whole model set is two commands.
+The split is not a preference. mGTE cannot run on transformers 5.x, mDenseOn
+cannot run on 4.x, and EmbeddingGemma-2 cannot run on sentence-transformers 5.x,
+all established by loading them rather than by reading metadata. The two harriers
+run in either of the first two, so a run covering the whole model set is three
+precompute commands.
 
 Everything downstream of the cache is unaffected: the cache stores plain fp32
-arrays, so DR, quantization and scoring all happen in one environment regardless of
-which one produced the embeddings.
+arrays, so DR, quantization and scoring all happen in the root environment
+regardless of which one produced the embeddings.
 """
 
 
@@ -532,29 +608,58 @@ def installed_transformers_major() -> int:
     return int(transformers.__version__.split(".")[0])
 
 
-def runnable_backbones(major: int | None = None) -> list[Backbone]:
-    """Backbones that can load under this `transformers` major version."""
-    major = installed_transformers_major() if major is None else major
-    return [b for b in all_backbones() if major in b.transformers_majors]
+def installed_sentence_transformers_major() -> int:
+    """Major version of the `sentence-transformers` installed in this interpreter."""
+    import sentence_transformers
+
+    return int(sentence_transformers.__version__.split(".")[0])
 
 
-def require_runnable(backbone: Backbone, major: int | None = None) -> None:
+def environments_for(backbone: Backbone) -> list[tuple[int, int]]:
+    """The registered environments `backbone` runs in."""
+    return [
+        key
+        for key in ENVIRONMENTS
+        if key[0] in backbone.transformers_majors
+        and key[1] in backbone.sentence_transformers_majors
+    ]
+
+
+def _installed(major: int | None, st_major: int | None) -> tuple[int, int]:
+    return (
+        installed_transformers_major() if major is None else major,
+        installed_sentence_transformers_major() if st_major is None else st_major,
+    )
+
+
+def runnable_backbones(major: int | None = None, st_major: int | None = None) -> list[Backbone]:
+    """Backbones that can load under these `transformers` / `sentence-transformers`
+    majors, by default the installed ones."""
+    key = _installed(major, st_major)
+    return [b for b in all_backbones() if key in environments_for(b)]
+
+
+def require_runnable(
+    backbone: Backbone, major: int | None = None, st_major: int | None = None
+) -> None:
     """Fail early, and with the fix, when a backbone is in the wrong environment.
 
     Without this the failure surfaces as `Unrecognized processing class` (mDenseOn
-    on 4.x) or as an IndexError inside `forward` with a nonsense index (mGTE on
-    5.x), neither of which names the actual problem.
+    on 4.x), as an IndexError inside `forward` with a nonsense index (mGTE on
+    5.x), or as a missing `sentence_transformers.base.modules.normalize`
+    (EmbeddingGemma-2 on sentence-transformers 5.x), none of which names the
+    actual problem.
     """
-    major = installed_transformers_major() if major is None else major
-    if major in backbone.transformers_majors:
+    key = _installed(major, st_major)
+    if key in environments_for(backbone):
         return
     supported = ", ".join(
-        f"{m}.x -> {ENVIRONMENTS.get(m, 'unregistered environment')}"
-        for m in backbone.transformers_majors
+        f"transformers {t}.x + sentence-transformers {st}.x -> {ENVIRONMENTS[(t, st)]}"
+        for t, st in environments_for(backbone)
     )
     raise RuntimeError(
-        f"{backbone.key} ({backbone.model_id}) does not run on transformers "
-        f"{major}.x. It needs: {supported}"
+        f"{backbone.key} ({backbone.model_id}) does not run on transformers {key[0]}.x "
+        f"with sentence-transformers {key[1]}.x. It needs: {supported or 'no registered environment'}"
     )
 
 

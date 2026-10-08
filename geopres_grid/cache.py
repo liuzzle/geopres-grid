@@ -204,7 +204,8 @@ class GeoPresCache:
 
 
 def side_of(prompt_type: Any) -> str:
-    """Cache side for an MTEB `prompt_type`; tasks without one (STS) are queries."""
+    """Cache side for an MTEB `prompt_type`; tasks without one (STS,
+    classification, clustering) are queries."""
     value = getattr(prompt_type, "value", prompt_type)
     if value in (None, "query"):
         return "query"
@@ -215,11 +216,29 @@ def side_of(prompt_type: Any) -> str:
 
 def prompt_side(prompt_type: Any) -> str:
     """Which registry prompt an MTEB `prompt_type` gets: `side_of`, except that a
-    task without one is "symmetric" (`Backbone.symmetric_prompt_name`). The cache
+    task without one is "symmetric" (`Backbone.task_prompt_names`). The cache
     path and the quantizer still use `side_of`."""
     if getattr(prompt_type, "value", prompt_type) is None:
         return "symmetric"
     return side_of(prompt_type)
+
+
+def _unit_rows(embeddings: Any) -> Any:
+    import torch
+
+    tensor = torch.as_tensor(np.asarray(embeddings, dtype=np.float32))
+    return torch.nn.functional.normalize(tensor, dim=-1)
+
+
+def cosine_similarity(embeddings1: Any, embeddings2: Any) -> Any:
+    """All-pairs cosine, as `SentenceTransformer.similarity` computes it for the five
+    backbones -- every one declares `similarity_fn_name: cosine`."""
+    return _unit_rows(embeddings1) @ _unit_rows(embeddings2).T
+
+
+def pairwise_cosine_similarity(embeddings1: Any, embeddings2: Any) -> Any:
+    """Row-wise cosine, `SentenceTransformer.similarity_pairwise` for cosine models."""
+    return (_unit_rows(embeddings1) * _unit_rows(embeddings2)).sum(dim=-1)
 
 
 class CachedBackbone:
@@ -231,20 +250,26 @@ class CachedBackbone:
     is byte-identical to the one the cache key hashes. ``prompt=""`` on a bare
     side also suppresses a model's ``default_prompt_name``, which
     ``prompt_name=None`` would not (sentence-transformers ``_resolve_prompt``).
+
+    ``model=None`` serves a warm cache with no model loaded -- the evaluation
+    path, which needs neither a GPU nor the backbone's environment. A miss is then
+    an error naming the block, never a silent encode on the CPU box. Similarity is
+    cosine either way, so a score does not depend on whether a model was loaded.
     """
 
     def __init__(
         self,
-        model: Any,
+        model: Any | None,
         backbone: Backbone,
         encode_config: EncodeConfig,
         cache_root: str | Path,
     ) -> None:
-        if encode_config.symmetric_prompt_name != backbone.symmetric_prompt_name:
+        expected = tuple(sorted(backbone.task_prompt_names.items()))
+        if encode_config.task_prompt_names != expected:
             raise ValueError(
-                f"EncodeConfig names symmetric prompt {encode_config.symmetric_prompt_name!r} "
-                f"but {backbone.key} uses {backbone.symmetric_prompt_name!r}; pass "
-                "symmetric_prompt_name=backbone.symmetric_prompt_name to from_model"
+                f"EncodeConfig names task prompts {dict(encode_config.task_prompt_names)!r} "
+                f"but {backbone.key} uses {backbone.task_prompt_names!r}; pass "
+                "task_prompt_names=backbone.task_prompt_names to from_model"
             )
         self._model = model
         self.backbone = backbone
@@ -269,22 +294,17 @@ class CachedBackbone:
         return self
 
     def similarity(self, embeddings1: Any, embeddings2: Any) -> Any:
-        return self._model.similarity(embeddings1, embeddings2)
+        return cosine_similarity(embeddings1, embeddings2)
 
     def similarity_pairwise(self, embeddings1: Any, embeddings2: Any) -> Any:
-        return self._model.similarity_pairwise(embeddings1, embeddings2)
+        return pairwise_cosine_similarity(embeddings1, embeddings2)
 
     def _side(self, prompt_type: Any) -> str:
         return side_of(prompt_type)
 
     def task_directory(self, task_name: str) -> Path:
         """Root of every cached block for one task: `{split}/{subset}/{side}` below."""
-        return (
-            self.cache_root
-            / f"{self.backbone.slug}@{self.backbone.revision}"
-            / self.encode_config.hash
-            / task_name
-        )
+        return backbone_cache_root(self.cache_root, self.backbone) / self.encode_config.hash / task_name
 
     def _cache_path(
         self, task_name: str, hf_split: str, hf_subset: str, side: str
@@ -317,7 +337,9 @@ class CachedBackbone:
         side = self._side(prompt_type)
         items = self._items(inputs)
         raw_texts = [str(item.get("text", "")) for item in items]
-        prefix = self.backbone.prompt_for(prompt_side(prompt_type))
+        prefix = self.backbone.prompt_for(
+            prompt_side(prompt_type), getattr(task_metadata, "type", None)
+        )
         prompted_texts = [prefix + text for text in raw_texts]
         cache = self._get_cache(
             self._cache_path(task_metadata.name, hf_split, hf_subset, side)
@@ -325,10 +347,23 @@ class CachedBackbone:
         cached, missing = cache.get_vectors(items, prompted_texts=prompted_texts)
         missing_indices = np.flatnonzero(missing)
         newly_encoded = np.empty((len(missing_indices), cache.dimension or self.backbone.native_dim), dtype=np.float32)
+        if len(missing_indices) and self._model is None:
+            raise RuntimeError(
+                f"{len(missing_indices)} of {len(items)} inputs are not cached in "
+                f"{cache.directory} and no model is loaded. Precompute this task "
+                "(scripts/precompute.py) or evaluate with --load-model."
+            )
         if len(missing_indices):
-            missing_items = [items[index] for index in missing_indices]
+            # One encode per distinct prompted text. Corpora repeat documents
+            # (NanoArguAna does), and two copies in differently padded batches come
+            # back differing in the last bits -- which `GeoPresCache.add` rightly
+            # refuses to store under one key.
+            first: dict[str, int] = {}
+            for index in missing_indices:
+                first.setdefault(prompted_texts[index], int(index))
+            unique = list(first.values())
             encoded = self._model.encode(
-                [raw_texts[index] for index in missing_indices],
+                [raw_texts[index] for index in unique],
                 prompt=prefix,
                 batch_size=batch_size,
                 convert_to_numpy=True,
@@ -336,14 +371,16 @@ class CachedBackbone:
             )
             if hasattr(encoded, "detach"):
                 encoded = encoded.detach().cpu().numpy()
-            newly_encoded = np.asarray(encoded, dtype=np.float32)
+            encoded = np.asarray(encoded, dtype=np.float32)
             cache.add(
-                missing_items,
-                newly_encoded,
-                prompted_texts=[prompted_texts[index] for index in missing_indices],
+                [items[index] for index in unique],
+                encoded,
+                prompted_texts=[prompted_texts[index] for index in unique],
             )
             cache.save()
-            self.newly_encoded += len(missing_indices)
+            self.newly_encoded += len(unique)
+            row_of = {prompted_texts[index]: row for row, index in enumerate(unique)}
+            newly_encoded = encoded[[row_of[prompted_texts[index]] for index in missing_indices]]
 
         if cached is None:
             result = np.empty((len(items), newly_encoded.shape[1]), dtype=np.float32)
@@ -368,3 +405,64 @@ def run_model_meta(backbone: Backbone, revision: str) -> Any:
     return ModelMeta.create_empty(
         overwrites={"name": f"geopres-grid/{backbone.key}", "revision": revision}
     )
+
+
+def backbone_cache_root(cache_root: str | Path, backbone: Backbone) -> Path:
+    """Directory holding every encode hash of one backbone at its pinned revision."""
+    return Path(cache_root) / f"{backbone.slug}@{backbone.revision}"
+
+
+def encode_configs_on_disk(cache_root: str | Path, backbone: Backbone) -> dict[str, EncodeConfig]:
+    """Encode configs with cached blocks for `backbone`, by hash, read from `meta.json`."""
+    configs: dict[str, EncodeConfig] = {}
+    root = backbone_cache_root(cache_root, backbone)
+    if not root.exists():
+        return configs
+    for directory in sorted(path for path in root.iterdir() if path.is_dir()):
+        meta_file = next(directory.glob("*/*/*/*/meta.json"), None)
+        if meta_file is not None:
+            configs[directory.name] = EncodeConfig.from_meta(
+                json.loads(meta_file.read_text(encoding="utf-8"))
+            )
+    return configs
+
+
+def resolve_encode_config(
+    cache_root: str | Path,
+    backbone: Backbone,
+    *,
+    encode_hash: str | None = None,
+    max_seq_length: int | None = None,
+) -> EncodeConfig:
+    """The one cached encode config for `backbone`, read off disk -- no model needed.
+
+    `encode_hash` picks one explicitly; otherwise the configs are filtered by
+    `max_seq_length` and the backbone's task prompts, and exactly one may remain.
+    Two can legitimately exist -- a harrier precomputed in both transformers
+    environments -- and then the caller has to choose.
+    """
+    configs = encode_configs_on_disk(cache_root, backbone)
+    root = backbone_cache_root(cache_root, backbone)
+    if encode_hash is not None:
+        if encode_hash not in configs:
+            raise LookupError(f"no cached encode hash {encode_hash} under {root}; found {sorted(configs) or 'none'}")
+        return configs[encode_hash]
+    expected = tuple(sorted(backbone.task_prompt_names.items()))
+    candidates = {
+        key: config
+        for key, config in configs.items()
+        if config.task_prompt_names == expected
+        and (max_seq_length is None or config.max_seq_length == max_seq_length)
+    }
+    if len(candidates) != 1:
+        found = ", ".join(
+            f"{key} (max_seq_length={c.max_seq_length}, transformers {c.transformers_version}, "
+            f"sentence-transformers {c.sentence_transformers_version})"
+            for key, c in configs.items()
+        )
+        raise LookupError(
+            f"{len(candidates)} cached encode configs for {backbone.key} match "
+            f"max_seq_length={max_seq_length} under {root} -- found: {found or 'none'}. "
+            "Precompute first, or pick one with --encode-hash."
+        )
+    return next(iter(candidates.values()))

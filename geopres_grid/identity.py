@@ -111,15 +111,16 @@ class EncodeConfig:
     transformers_version: str
     external_code_revisions: tuple[tuple[str, str], ...] = ()
     """repo id -> commit sha for code loaded from outside the model's own repo."""
-    symmetric_prompt_name: str | None = None
-    """Prompt applied to tasks MTEB encodes without a `prompt_type` (STS), when it
-    is not the query prompt. `Backbone.symmetric_prompt_name`.
+    task_prompt_names: tuple[tuple[str, str], ...] = ()
+    """MTEB task type -> prompt name, for tasks MTEB encodes without a
+    `prompt_type`, sorted. `Backbone.task_prompt_names`; a type missing here gets
+    the query prompt.
 
-    Hashed only when set: `prompts` pins every prefix the model declares but not
-    which one a symmetric task gets, and the result slot is named by this hash, so
-    a changed choice must move it or MTEB's `only-missing` returns the old scores.
-    Left out of the payload when None, so the hash of every backbone that uses its
-    query prompt there is unchanged.
+    Hashed only when non-empty: `prompts` pins every prefix the model declares but
+    not which one a symmetric task gets, and the result slot is named by this hash,
+    so a changed choice must move it or MTEB's `only-missing` returns the old
+    scores. Left out of the payload when empty, so the hash of every backbone that
+    uses its query prompt there is unaffected.
     """
 
     # Recorded, not hashed. See `to_meta`.
@@ -150,6 +151,7 @@ class EncodeConfig:
         object.__setattr__(
             self, "external_code_revisions", tuple(sorted(self.external_code_revisions))
         )
+        object.__setattr__(self, "task_prompt_names", tuple(sorted(self.task_prompt_names)))
 
     def to_hashable(self) -> dict[str, Any]:
         """The fields that define the embedding, as a JSON-ready dict."""
@@ -159,8 +161,8 @@ class EncodeConfig:
             payload[name] = (
                 {k: v for k, v in value} if isinstance(value, tuple) else value
             )
-        if self.symmetric_prompt_name is not None:
-            payload["symmetric_prompt_name"] = self.symmetric_prompt_name
+        if self.task_prompt_names:
+            payload["task_prompt_names"] = dict(self.task_prompt_names)
         return payload
 
     @property
@@ -206,7 +208,7 @@ class EncodeConfig:
         dtype: str = "float32",
         device: str = "",
         batch_size: int | None = None,
-        symmetric_prompt_name: str | None = None,
+        task_prompt_names: dict[str, str] | None = None,
         resolve_external_code: bool = True,
         hf_token: str | None = None,
     ) -> EncodeConfig:
@@ -240,12 +242,46 @@ class EncodeConfig:
             ),
             transformers_version=minor_version(transformers.__version__),
             external_code_revisions=tuple(external),
-            symmetric_prompt_name=symmetric_prompt_name,
+            task_prompt_names=tuple((task_prompt_names or {}).items()),
             torch_version=torch.__version__,
             device=device,
             batch_size=batch_size,
         )
 
+
+    @classmethod
+    def from_meta(cls, meta: dict[str, Any]) -> EncodeConfig:
+        """Rebuild from a cache block's `meta.json` (`to_meta`), without the model.
+
+        This is what lets evaluation run on a warm cache with no model loaded and
+        in any environment: the transformers version an mDenseOn cache was written
+        under is read back, not re-derived from whatever is installed here. Raises
+        when the rebuilt hash differs from the recorded one, which would mean the
+        hashed surface changed since the block was written.
+        """
+        hashed = meta["hashed"]
+        recorded = meta.get("recorded_only", {})
+        config = cls(
+            model_id=hashed["model_id"],
+            revision=hashed["revision"],
+            max_seq_length=int(hashed["max_seq_length"]),
+            dtype=hashed["dtype"],
+            prompts=tuple(hashed["prompts"].items()),
+            sentence_transformers_version=hashed["sentence_transformers_version"],
+            transformers_version=hashed["transformers_version"],
+            external_code_revisions=tuple(hashed["external_code_revisions"].items()),
+            task_prompt_names=tuple(hashed.get("task_prompt_names", {}).items()),
+            torch_version=recorded.get("torch_version", ""),
+            device=recorded.get("device", ""),
+            batch_size=recorded.get("batch_size"),
+            notes=recorded.get("notes", ""),
+        )
+        if config.hash != meta["encode_config_hash"]:
+            raise ValueError(
+                f"meta.json records encode hash {meta['encode_config_hash']} but its "
+                f"hashed fields rebuild to {config.hash}"
+            )
+        return config
 
 # --- post-processing side ---------------------------------------------------
 
@@ -307,7 +343,7 @@ class PostProcConfig:
 
     Default normalisation is `normalize -> reduce -> normalize`. The first puts every
     backbone on the unit sphere: all five score by cosine, so only direction
-    carries meaning, and it stops the two non-normalising stacks' per-vector norm
+    carries meaning, and it stops mDenseOn's non-normalising stack's per-vector norm
     spread from entering PCA's mean and the quantizer's fitted ranges. The second
     is a no-op for cosine scoring and exists only because scalar quantization is
     not scale-invariant and reduction does not preserve norms.
