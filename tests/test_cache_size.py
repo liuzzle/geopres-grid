@@ -95,3 +95,39 @@ def test_estimate_task_counts_legacy_clustering_sentences_across_subsets():
     backbone = SimpleNamespace(key="fake", native_dim=1)
 
     assert estimate_task(task, backbone)["queries"] == 8
+
+
+def test_totals_count_a_shared_corpus_once():
+    from scripts.estimate_cache_size import totals
+
+    backbone = SimpleNamespace(key="fake", native_dim=2)
+
+    def task(name, documents):
+        return SimpleNamespace(
+            name=name,
+            metadata=SimpleNamespace(name=name, eval_splits=["test"]),
+            dataset={"default": {"test": {"corpus": [{}] * documents, "queries": [{}]}}},
+        )
+
+    rows = [estimate_task(task(name, n), backbone) for name, n in (("FEVER", 10), ("ClimateFEVER", 12), ("NQ", 5))]
+    result = totals(rows)
+
+    assert [row["corpus"] for row in rows] == ["corpus-fever-wikipedia", "corpus-fever-wikipedia", "NQ"]
+    assert result["fake"]["document_bytes"] == (12 + 5) * 2 * 4
+    assert result["fake"]["query_bytes"] == 3 * 2 * 4
+    assert result["all"] == result["fake"]
+
+
+def test_estimate_task_reads_a_monolingual_non_retrieval_task():
+    """STSBenchmark loads as `dataset[split]`, with no subset level."""
+    task = SimpleNamespace(
+        name="FakeSTS",
+        metadata=SimpleNamespace(name="FakeSTS", eval_splits=["test"], type="STS"),
+        dataset={
+            "train": FakeRows([{"sentence1": "a", "sentence2": "b", "score": 1.0}] * 7),
+            "test": FakeRows([{"sentence1": "a", "sentence2": "b", "score": 1.0}] * 3),
+        },
+    )
+    backbone = SimpleNamespace(key="fake", native_dim=4)
+
+    assert estimate_task(task, backbone)["queries"] == 6

@@ -145,18 +145,22 @@ CALIBRATION_SEED = 0
 
 
 def cached_blocks(
-    task_directory: Path,
+    roots: Path | tuple[Path, ...],
     *,
     splits: list[str] | None = None,
     subsets: list[str] | None = None,
 ) -> dict[str, list[np.ndarray]]:
-    """Memory-mapped cache blocks of one task (`CachedBackbone.task_directory`), by side.
+    """Memory-mapped cache blocks of one task, by side. `roots` is
+    `CachedBackbone.block_roots`: the task directory, plus the shared corpus
+    directory for a task in `cache.SHARED_CORPORA`.
 
     Raises when the task has no cached vectors: calibration must come from a
     finished warm-up pass, never from whatever happened to be cached so far.
     """
+    roots = (roots,) if isinstance(roots, (str, Path)) else tuple(roots)
     blocks: dict[str, list[np.ndarray]] = {"query": [], "document": []}
-    for path in sorted(Path(task_directory).glob("*/*/*/embeddings.npy")):
+    paths = [path for root in roots for path in sorted(Path(root).glob("*/*/*/embeddings.npy"))]
+    for path in paths:
         side_dir = path.parent
         subset, split = side_dir.parent.name, side_dir.parent.parent.name
         if splits and split not in splits:
@@ -166,7 +170,7 @@ def cached_blocks(
         blocks[side_dir.name].append(np.load(path, mmap_mode="r"))
     if not any(blocks.values()):
         raise FileNotFoundError(
-            f"No cached embeddings under {task_directory}; "
+            f"No cached embeddings under {', '.join(str(root) for root in roots)}; "
             "run the warm-up pass (or scripts/precompute.py) first"
         )
     return blocks
@@ -403,7 +407,7 @@ def evaluate_cell(
         return baseline, baseline
     for leaf in leaf_tasks(task):
         blocks = cached_blocks(
-            cell.cached.task_directory(leaf.metadata.name),
+            cell.cached.block_roots(leaf.metadata.name),
             splits=list(leaf.eval_splits),
             subsets=list(leaf.hf_subsets),
         )

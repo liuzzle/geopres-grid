@@ -16,6 +16,43 @@ from geopres_grid.backbones import Backbone
 from geopres_grid.identity import EncodeConfig
 
 
+SHARED_CORPORA: dict[str, str] = {
+    "FEVER": "fever-wikipedia",
+    "ClimateFEVER": "fever-wikipedia",
+}
+"""Retrieval tasks that encode the same corpus, by shared-corpus name.
+
+BEIR's ClimateFEVER reuses FEVER's Wikipedia dump: 5,416,568 unique texts in
+FEVER, 5,416,593 in ClimateFEVER (mteb 2.15.1 descriptive stats), about 18 GB
+per model at 768-d fp32. Their document blocks share one directory. Keys are
+`sha256(prompted text)`, so the block holds the union and each task finds its own
+documents in it; correctness does not depend on the corpora being identical, only
+the saving does. Queries stay per task.
+
+Two consequences. A task's calibration sample is drawn from the union, which for
+FEVER adds 25 rows in 5.4M. And row order is fixed by whichever task was
+precomputed first; `TIER_TASKS` lists FEVER first. Never precompute two tasks of
+one group for the same backbone in parallel jobs: both would write the one block.
+"""
+
+
+def corpus_directory_name(task_name: str) -> str:
+    """Directory, beside the task directories of one encode hash, holding
+    `task_name`'s document blocks: the task's own, or its shared corpus's."""
+    shared = SHARED_CORPORA.get(task_name)
+    return f"corpus-{shared}" if shared else task_name
+
+
+def task_block_roots(encode_root: str | Path, task_name: str) -> tuple[Path, ...]:
+    """Directories under one encode hash that hold `task_name`'s blocks, each laid
+    out `{split}/{subset}/{side}`: the task directory, plus its shared corpus."""
+    roots = [Path(encode_root) / task_name]
+    corpus = corpus_directory_name(task_name)
+    if corpus != task_name:
+        roots.append(Path(encode_root) / corpus)
+    return tuple(roots)
+
+
 class GeoPresCache:
     """Store fp32 embeddings and a positional parquet index.
 
@@ -60,6 +97,17 @@ class GeoPresCache:
             return
         self._ids = pd.read_parquet(self.ids_file)
         self._ids["row_idx"] = self._ids["row_idx"].astype(int)
+        rows = int(np.load(self.embeddings_file, mmap_mode="r").shape[0])
+        if rows != len(self._ids):
+            # The array and the index are written separately. Two writers on one
+            # block (a shared corpus precomputed by parallel jobs) can leave them
+            # from different runs, and every lookup would then be silently wrong.
+            # A crash between the two writes looks the same from here.
+            raise ValueError(
+                f"{self.directory}: embeddings.npy has {rows} rows but ids.parquet "
+                f"{len(self._ids)} -- two writers or an interrupted write; delete "
+                "the block and precompute it again"
+            )
         self._index = {
             str(text_hash): int(row_idx)
             for text_hash, row_idx in zip(self._ids["text_hash"], self._ids["row_idx"])
@@ -302,14 +350,24 @@ class CachedBackbone:
     def _side(self, prompt_type: Any) -> str:
         return side_of(prompt_type)
 
+    @property
+    def encode_directory(self) -> Path:
+        return backbone_cache_root(self.cache_root, self.backbone) / self.encode_config.hash
+
     def task_directory(self, task_name: str) -> Path:
-        """Root of every cached block for one task: `{split}/{subset}/{side}` below."""
-        return backbone_cache_root(self.cache_root, self.backbone) / self.encode_config.hash / task_name
+        """The task's own blocks, `{split}/{subset}/{side}` below. A task in
+        `SHARED_CORPORA` keeps only its queries here; see `block_roots`."""
+        return self.encode_directory / task_name
+
+    def block_roots(self, task_name: str) -> tuple[Path, ...]:
+        """Every directory holding `task_name`'s blocks (`task_block_roots`)."""
+        return task_block_roots(self.encode_directory, task_name)
 
     def _cache_path(
         self, task_name: str, hf_split: str, hf_subset: str, side: str
     ) -> Path:
-        return self.task_directory(task_name) / hf_split / hf_subset / side
+        owner = corpus_directory_name(task_name) if side == "document" else task_name
+        return self.encode_directory / owner / hf_split / hf_subset / side
 
     def _get_cache(self, path: Path) -> GeoPresCache:
         if path not in self._caches:

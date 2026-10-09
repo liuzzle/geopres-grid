@@ -464,3 +464,64 @@ def test_two_cached_configs_must_be_chosen_between(tmp_path):
     with pytest.raises(LookupError, match="--encode-hash"):
         resolve_encode_config(tmp_path, get("harrier-270m"))
     assert resolve_encode_config(tmp_path, get("harrier-270m"), encode_hash=second.hash) == second
+
+
+class FakeFEVERMetadata:
+    name = "FEVER"
+    type = "Retrieval"
+
+
+class FakeClimateFEVERMetadata:
+    name = "ClimateFEVER"
+    type = "Retrieval"
+
+
+def test_fever_and_climate_fever_share_one_document_block(tmp_path):
+    """ClimateFEVER reuses FEVER's 5.4M-passage corpus; it is stored once."""
+    from geopres_grid.evaluation import cached_blocks
+
+    model = FakeModel()
+    wrapper = CachedBackbone(model, get("mdenseon"), make_encode_config(), tmp_path)
+    shared = [{"id": f"d{i}", "text": f"passage {i}"} for i in range(3)]
+    extra = {"id": "d3", "text": "only in ClimateFEVER"}
+
+    for metadata, documents in ((FakeFEVERMetadata(), shared), (FakeClimateFEVERMetadata(), shared + [extra])):
+        for prompt_type, rows in (("document", documents), ("query", [{"id": "q", "text": metadata.name}])):
+            wrapper.encode(
+                FakeInputs(rows),
+                task_metadata=metadata,
+                hf_split="test",
+                hf_subset="default",
+                prompt_type=prompt_type,
+            )
+
+    assert wrapper.newly_encoded == 3 + 1 + 1 + 1  # FEVER corpus, FEVER query, extra, ClimateFEVER query
+    fever = wrapper._cache_path("FEVER", "test", "default", "document")
+    assert fever == wrapper._cache_path("ClimateFEVER", "test", "default", "document")
+    assert fever.parent.parent.parent.name == "corpus-fever-wikipedia"
+    assert not (wrapper.task_directory("ClimateFEVER") / "test" / "default" / "document").exists()
+    wrapper.close()
+
+    blocks = cached_blocks(wrapper.block_roots("ClimateFEVER"))
+    assert [len(block) for block in blocks["document"]] == [4]
+    assert [len(block) for block in blocks["query"]] == [1]
+
+
+def test_shared_corpus_groups_are_tier_two_tasks_in_a_fixed_order():
+    """Row order of a shared block is set by the first task precomputed."""
+    from geopres_grid.cache import SHARED_CORPORA
+    from geopres_grid.evaluation import BEIR_TASKS
+
+    assert set(SHARED_CORPORA) <= set(BEIR_TASKS)
+    assert BEIR_TASKS.index("FEVER") < BEIR_TASKS.index("ClimateFEVER")
+
+
+def test_a_block_whose_index_and_array_disagree_is_refused(tmp_path):
+    cache = GeoPresCache(tmp_path)
+    cache.add([{"id": "a", "text": "a"}, {"id": "b", "text": "b"}], np.ones((2, 3)))
+    cache.save()
+    cache.close()
+    np.save(tmp_path / "embeddings.npy", np.ones((3, 3), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="two writers"):
+        GeoPresCache(tmp_path).load()

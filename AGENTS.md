@@ -129,6 +129,10 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   the title. `SentenceTransformer.encode` does not accept MTEB's `DataLoader`; misses
   go in as strings with the registry prefix as `prompt=` (`""`, not `None`, on a bare
   side, or a `default_prompt_name` would apply).
+- **FEVER and ClimateFEVER share one document block** (`cache.SHARED_CORPORA`,
+  `corpus-fever-wikipedia/`). Read a task's blocks through
+  `CachedBackbone.block_roots`, not `task_directory`, and never precompute both
+  for one backbone in parallel jobs: two writers corrupt the block.
 - **Whether a quantizer shares one grid across coordinates decides how much PCA+ROR
   matters.** `EqualCount` (Kisako et al. §3.4: one global table) and `Binary` share
   one; `UniformAffine` fits a range per dimension and absorbs most of PCA's variance

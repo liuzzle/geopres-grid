@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from geopres_grid.backbones import get
-from geopres_grid.cache import backbone_cache_root, resolve_encode_config
+from geopres_grid.cache import backbone_cache_root, resolve_encode_config, task_block_roots
 from geopres_grid.evaluation import CALIBRATION_MAX_ROWS, CALIBRATION_SEED, cached_blocks, sample_rows
 from geopres_grid.identity import DR_METHODS, PostProcConfig
 from geopres_grid.quantizers import calibration_symmetry_ablation
@@ -24,8 +24,8 @@ from geopres_grid.reducers import PostProcessingPipeline
 DEFAULT_METHODS = ("int8", "int4", "int2", "equal_count_8", "equal_count_4", "equal_count_2")
 
 
-def resolve_task_directory(cache_root: Path, backbone_key: str, encode_hash: str | None, task: str) -> Path:
-    """`CachedBackbone.task_directory` without loading the model.
+def resolve_block_roots(cache_root: Path, backbone_key: str, encode_hash: str | None, task: str) -> tuple[Path, ...]:
+    """`CachedBackbone.block_roots` without loading the model.
 
     The encode hash comes from the model, so it is either given or read off the
     cache (`cache.resolve_encode_config`): exactly one config must match.
@@ -35,7 +35,7 @@ def resolve_task_directory(cache_root: Path, backbone_key: str, encode_hash: str
         config = resolve_encode_config(cache_root, backbone, encode_hash=encode_hash)
     except LookupError as error:
         raise SystemExit(str(error)) from error
-    return backbone_cache_root(cache_root, backbone) / config.hash / task
+    return task_block_roots(backbone_cache_root(cache_root, backbone) / config.hash, task)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         from geopres_grid.config import EMBEDDING_CACHE_PATH
 
         args.cache_root = Path(EMBEDDING_CACHE_PATH)
-    blocks = cached_blocks(resolve_task_directory(args.cache_root, args.backbone, args.encode_hash, args.task))
+    blocks = cached_blocks(resolve_block_roots(args.cache_root, args.backbone, args.encode_hash, args.task))
     if not blocks["query"] or not blocks["document"]:
         raise SystemExit(f"{args.task} needs cached query and document blocks")
 
