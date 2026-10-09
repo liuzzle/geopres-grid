@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -57,11 +58,21 @@ CONFIG_COLUMNS = (
 
 
 def write_run_record(results_root: str | Path, record: dict[str, Any]) -> Path:
-    """Store the configuration of one result slot as `runs/<revision>.json`."""
+    """Store the configuration of one result slot as `runs/<revision>.json`.
+
+    Written to a temporary file and renamed: every shard of a grid run rewrites
+    the baseline's record, and a reader must never see a half-written one.
+    """
     directory = Path(results_root) / RUNS_DIRECTORY
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{record['revision']}.json"
-    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    fd, name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, indent=2, sort_keys=True))
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
     return path
 
 

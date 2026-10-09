@@ -85,6 +85,23 @@ reads the encode config back from the cache's `meta.json` and runs on CPU, in th
 root environment, without loading the model; a cache miss is an error.
 `--load-model` restores encoding for a cold cache on a small task set.
 
+### Running the grid
+
+The cells are fixed in `geopres_grid/grid.py`: no DR, plus `truncate`, `pca`,
+`pca_ror`, `random_projection` and `random_selection` at 64/128/256/512 (below the
+model's native dimension), each with `none`, `fp16`, `int8`, `int4`, `int2`,
+`binary` and `equal_count_{8,4,2}`. That is 189 cells per backbone; GeoPres runs
+separately once its projections are trained.
+
+```bash
+scripts/slurm/submit_grid.sh harrier-270m tier1     # cluster: baselines, then the cells (CPU)
+uv run python scripts/run_grid.py --backbone harrier-270m --tier tier0   # locally, one process
+```
+
+`submit_grid.sh` scores the fp32 baselines first and starts the shards only once
+they succeeded, so no two shards write the same result. MTEB skips any (cell, task)
+already scored, so a shard that hit its time limit is resumed by resubmitting it.
+
 ### Task sets
 
 | `--tier` | Tasks | Split |

@@ -142,3 +142,13 @@ def test_averages_are_missing_when_a_task_is_missing(tmp_path):
     row = wide.xs(cell_record["revision"], level="run_id").iloc[0]
     assert row["AVG_RETRIEVAL"] == pytest.approx(0.54)
     assert row.isna()["AVG_STS"] and row.isna()["AVG_ALL"]
+
+
+def test_a_run_record_is_replaced_whole_and_leaves_no_temporary_file(tmp_path):
+    from geopres_grid.results import RUNS_DIRECTORY, write_run_record
+
+    write_run_record(tmp_path, {"revision": "abc", "value": 1})
+    path = write_run_record(tmp_path, {"revision": "abc", "value": 2})
+
+    assert json.loads(path.read_text())["value"] == 2
+    assert [p.name for p in (tmp_path / RUNS_DIRECTORY).iterdir()] == ["abc.json"]
