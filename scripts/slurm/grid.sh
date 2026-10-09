@@ -16,8 +16,10 @@ set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME=${HF_HOME:-/scratch/$USER/hf}
-# numpy and torch otherwise start one thread per core of the node, not of the job.
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4} MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+# numpy (OpenBLAS) and torch otherwise start one thread per core of the node, not
+# of the job; on the login node that alone exhausts the per-user memory limit.
+threads=${SLURM_CPUS_PER_TASK:-4}
+export OMP_NUM_THREADS=$threads MKL_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads
 
 cd "${SLURM_SUBMIT_DIR:-.}"
 echo "Starting grid $* on $(hostname): $(date)"
