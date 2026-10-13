@@ -2,6 +2,7 @@ import dataclasses
 import json
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from geopres_grid.cache import GeoPresCache
@@ -476,17 +477,9 @@ class FakeClimateFEVERMetadata:
     type = "Retrieval"
 
 
-def test_fever_and_climate_fever_share_one_document_block(tmp_path):
-    """ClimateFEVER reuses FEVER's 5.4M-passage corpus; it is stored once."""
-    from geopres_grid.evaluation import cached_blocks
-
-    model = FakeModel()
-    wrapper = CachedBackbone(model, get("mdenseon"), make_encode_config(), tmp_path)
-    shared = [{"id": f"d{i}", "text": f"passage {i}"} for i in range(3)]
-    extra = {"id": "d3", "text": "only in ClimateFEVER"}
-
-    for metadata, documents in ((FakeFEVERMetadata(), shared), (FakeClimateFEVERMetadata(), shared + [extra])):
-        for prompt_type, rows in (("document", documents), ("query", [{"id": "q", "text": metadata.name}])):
+def encode_retrieval(wrapper, metadata, documents, queries):
+    for prompt_type, rows in (("document", documents), ("query", queries)):
+        if rows:
             wrapper.encode(
                 FakeInputs(rows),
                 task_metadata=metadata,
@@ -495,25 +488,62 @@ def test_fever_and_climate_fever_share_one_document_block(tmp_path):
                 prompt_type=prompt_type,
             )
 
-    assert wrapper.newly_encoded == 3 + 1 + 1 + 1  # FEVER corpus, FEVER query, extra, ClimateFEVER query
-    fever = wrapper._cache_path("FEVER", "test", "default", "document")
-    assert fever == wrapper._cache_path("ClimateFEVER", "test", "default", "document")
-    assert fever.parent.parent.parent.name == "corpus-fever-wikipedia"
-    assert not (wrapper.task_directory("ClimateFEVER") / "test" / "default" / "document").exists()
+
+FEVER_PASSAGES = [{"id": f"d{i}", "text": f"passage {i}"} for i in range(3)]
+
+
+def test_climate_fever_starts_from_a_verified_copy_of_fever(tmp_path):
+    """ClimateFEVER reuses FEVER's 5.4M-passage corpus: copied, not re-encoded."""
+    from geopres_grid.cache import copy_document_blocks
+    from geopres_grid.evaluation import cached_blocks
+
+    wrapper = CachedBackbone(FakeModel(), get("mdenseon"), make_encode_config(), tmp_path)
+    encode_retrieval(wrapper, FakeFEVERMetadata(), FEVER_PASSAGES, [{"id": "q", "text": "FEVER"}])
     wrapper.close()
+    root = wrapper.encode_directory
 
-    blocks = cached_blocks(wrapper.block_roots("ClimateFEVER"))
-    assert [len(block) for block in blocks["document"]] == [4]
-    assert [len(block) for block in blocks["query"]] == [1]
+    copied = copy_document_blocks(root, "FEVER", "ClimateFEVER", splits=["test"], subsets=["default"])
+
+    target = root / "ClimateFEVER" / "test" / "default" / "document"
+    assert copied == [target]
+    for name in ("embeddings.npy", "ids.parquet", "meta.json"):
+        assert (target / name).read_bytes() == (root / "FEVER" / "test" / "default" / "document" / name).read_bytes()
+    assert not list(target.parent.glob(".document-copy-*"))
+
+    climate = CachedBackbone(FakeModel(), get("mdenseon"), make_encode_config(), tmp_path)
+    extra = {"id": "d3", "text": "only in ClimateFEVER"}
+    encode_retrieval(climate, FakeClimateFEVERMetadata(), FEVER_PASSAGES + [extra], [{"id": "q", "text": "ClimateFEVER"}])
+    climate.close()
+
+    assert climate.newly_encoded == 1 + 1  # the extra passage and the query
+    assert [len(block) for block in cached_blocks(climate.task_directory("ClimateFEVER"))["document"]] == [4]
+    assert [len(block) for block in cached_blocks(climate.task_directory("FEVER"))["document"]] == [3]
 
 
-def test_shared_corpus_groups_are_tier_two_tasks_in_a_fixed_order():
-    """Row order of a shared block is set by the first task precomputed."""
-    from geopres_grid.cache import SHARED_CORPORA
+def test_corpus_copy_needs_a_finished_source_and_a_missing_target(tmp_path):
+    from geopres_grid.cache import copy_document_blocks
+
+    wrapper = CachedBackbone(FakeModel(), get("mdenseon"), make_encode_config(), tmp_path)
+    root = wrapper.encode_directory
+    copy = lambda: copy_document_blocks(root, "FEVER", "ClimateFEVER", splits=["test"], subsets=["default"])
+
+    assert copy() == []  # nothing cached
+    encode_retrieval(wrapper, FakeFEVERMetadata(), FEVER_PASSAGES, [])
+    assert copy() == []  # documents written, queries not: FEVER may still be running
+    encode_retrieval(wrapper, FakeClimateFEVERMetadata(), [{"id": "x", "text": "own"}], [])
+    encode_retrieval(wrapper, FakeFEVERMetadata(), [], [{"id": "q", "text": "FEVER"}])
+    wrapper.close()
+    assert copy() == []  # ClimateFEVER already has a block: never overwritten
+    assert len(pd.read_parquet(root / "ClimateFEVER" / "test" / "default" / "document" / "ids.parquet")) == 1
+
+
+def test_corpus_copy_sources_are_precomputed_before_their_targets():
+    """Within one tier-2 job, FEVER must be finished when ClimateFEVER starts."""
+    from geopres_grid.cache import CORPUS_COPIES
     from geopres_grid.evaluation import BEIR_TASKS
 
-    assert set(SHARED_CORPORA) <= set(BEIR_TASKS)
-    assert BEIR_TASKS.index("FEVER") < BEIR_TASKS.index("ClimateFEVER")
+    for target, source in CORPUS_COPIES.items():
+        assert BEIR_TASKS.index(source) < BEIR_TASKS.index(target)
 
 
 def test_a_block_whose_index_and_array_disagree_is_refused(tmp_path):

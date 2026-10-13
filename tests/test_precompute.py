@@ -16,14 +16,14 @@ TASK_METADATA = mteb.get_tasks(tasks=["NanoArguAnaRetrieval"])[0].metadata
 class FakeTask:
     """A loaded retrieval task in MTEB's v2 layout, with real task metadata."""
 
-    def __init__(self, corpus, queries):
-        self.metadata = TASK_METADATA
-        self.eval_splits = ["train"]
+    def __init__(self, corpus, queries, metadata=TASK_METADATA, split="train"):
+        self.metadata = metadata
+        self.eval_splits = [split]
         self.hf_subsets = ["default"]
         self.converted = False
         self.dataset = {
             "default": {
-                "train": {
+                split: {
                     "corpus": Dataset.from_list(corpus),
                     "queries": Dataset.from_list(queries),
                 }
@@ -142,6 +142,22 @@ def test_precompute_refuses_to_cache_nothing(tmp_path):
             task=FakeTask([], QUERIES),
             cache_root=tmp_path,
         )
+
+
+def test_climate_fever_precompute_copies_fever_and_encodes_only_the_rest(tmp_path):
+    fever, climate = (mteb.get_tasks(tasks=[name])[0].metadata for name in ("FEVER", "ClimateFEVER"))
+    common = dict(backbone=get("mdenseon"), encode_config=make_encode_config(), cache_root=tmp_path)
+    precompute_task_cache(model=FakeModel(), task=FakeTask(CORPUS, QUERIES, fever, "test"), **common)
+
+    model = FakeModel()
+    extra = {"id": "d3", "title": "", "text": "Only in ClimateFEVER."}
+    result = precompute_task_cache(
+        model=model, task=FakeTask(CORPUS + [extra], [{"id": "c1", "text": "is it warming"}], climate, "test"), **common
+    )
+
+    assert len(result["copied_blocks"]) == 1
+    assert result["copied_blocks"][0].endswith("ClimateFEVER/test/default/document")
+    assert model.seen == ["document: Only in ClimateFEVER.", "query: is it warming"]
 
 
 def test_leaf_tasks_expands_aggregates():

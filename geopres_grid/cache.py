@@ -16,41 +16,69 @@ from geopres_grid.backbones import Backbone
 from geopres_grid.identity import EncodeConfig
 
 
-SHARED_CORPORA: dict[str, str] = {
-    "FEVER": "fever-wikipedia",
-    "ClimateFEVER": "fever-wikipedia",
-}
-"""Retrieval tasks that encode the same corpus, by shared-corpus name.
+CORPUS_COPIES: dict[str, str] = {"ClimateFEVER": "FEVER"}
+"""Retrieval tasks whose document blocks start as a copy of another task's.
 
 BEIR's ClimateFEVER reuses FEVER's Wikipedia dump: 5,416,568 unique texts in
 FEVER, 5,416,593 in ClimateFEVER (mteb 2.15.1 descriptive stats), about 18 GB
-per model at 768-d fp32. Their document blocks share one directory. Keys are
-`sha256(prompted text)`, so the block holds the union and each task finds its own
-documents in it; correctness does not depend on the corpora being identical, only
-the saving does. Queries stay per task.
+per model at 768-d fp32. Each task keeps its own block -- disk is not the
+constraint (Andrianos, 13.10) -- but the second need not be encoded from scratch:
+`precompute_task_cache` copies the source's finished block first
+(`copy_document_blocks`) and then encodes only the misses.
 
-Two consequences. A task's calibration sample is drawn from the union, which for
-FEVER adds 25 rows in 5.4M. And row order is fixed by whichever task was
-precomputed first; `TIER_TASKS` lists FEVER first. Never precompute two tasks of
-one group for the same backbone in parallel jobs: both would write the one block.
+No key changes in the copy. Keys are `sha256(prompted text)`, and the document
+prompt does not depend on the task, so FEVER's keys are ClimateFEVER's keys. The
+copied block keeps whatever FEVER-only passages exist; they are never looked up,
+but they sit in ClimateFEVER's calibration sample like any cached row.
 """
 
 
-def corpus_directory_name(task_name: str) -> str:
-    """Directory, beside the task directories of one encode hash, holding
-    `task_name`'s document blocks: the task's own, or its shared corpus's."""
-    shared = SHARED_CORPORA.get(task_name)
-    return f"corpus-{shared}" if shared else task_name
+def copy_document_blocks(
+    encode_root: str | Path,
+    source: str,
+    target: str,
+    *,
+    splits: Iterable[str],
+    subsets: Iterable[str],
+) -> list[Path]:
+    """Copy `source`'s document blocks to `target` under one encode hash, verified.
 
+    Only a block that does not exist yet for `target` is copied, and only from a
+    finished `source`: precompute writes a task's documents before its queries,
+    so the source's query block must exist too. Each copy is written to a
+    temporary directory, compared byte for byte with the source, loaded (the
+    row-count check), and only then renamed into place, so a crash leaves no
+    half-copied block. Returns the blocks copied.
+    """
+    import filecmp
+    import shutil
 
-def task_block_roots(encode_root: str | Path, task_name: str) -> tuple[Path, ...]:
-    """Directories under one encode hash that hold `task_name`'s blocks, each laid
-    out `{split}/{subset}/{side}`: the task directory, plus its shared corpus."""
-    roots = [Path(encode_root) / task_name]
-    corpus = corpus_directory_name(task_name)
-    if corpus != task_name:
-        roots.append(Path(encode_root) / corpus)
-    return tuple(roots)
+    encode_root = Path(encode_root)
+    copied: list[Path] = []
+    for split in splits:
+        for subset in subsets:
+            destination = encode_root / target / split / subset / "document"
+            origin = encode_root / source / split / subset / "document"
+            finished = (encode_root / source / split / subset / "query" / "ids.parquet").exists()
+            if destination.exists() or not (origin / "ids.parquet").exists() or not finished:
+                continue
+            GeoPresCache(origin).load()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(dir=destination.parent, prefix=".document-copy-"))
+            try:
+                names = ("embeddings.npy", "ids.parquet", "meta.json")
+                for name in names:
+                    if (origin / name).exists():
+                        shutil.copyfile(origin / name, staging / name)
+                for name in names:
+                    if (origin / name).exists() and not filecmp.cmp(origin / name, staging / name, shallow=False):
+                        raise RuntimeError(f"copy of {origin / name} differs from its source")
+                GeoPresCache(staging).load()
+                os.rename(staging, destination)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+            copied.append(destination)
+    return copied
 
 
 class GeoPresCache:
@@ -99,10 +127,9 @@ class GeoPresCache:
         self._ids["row_idx"] = self._ids["row_idx"].astype(int)
         rows = int(np.load(self.embeddings_file, mmap_mode="r").shape[0])
         if rows != len(self._ids):
-            # The array and the index are written separately. Two writers on one
-            # block (a shared corpus precomputed by parallel jobs) can leave them
-            # from different runs, and every lookup would then be silently wrong.
-            # A crash between the two writes looks the same from here.
+            # The array and the index are written separately. A crash between the
+            # two writes, or two writers on one block, leaves them from different
+            # runs, and every lookup would then be silently wrong.
             raise ValueError(
                 f"{self.directory}: embeddings.npy has {rows} rows but ids.parquet "
                 f"{len(self._ids)} -- two writers or an interrupted write; delete "
@@ -355,19 +382,13 @@ class CachedBackbone:
         return backbone_cache_root(self.cache_root, self.backbone) / self.encode_config.hash
 
     def task_directory(self, task_name: str) -> Path:
-        """The task's own blocks, `{split}/{subset}/{side}` below. A task in
-        `SHARED_CORPORA` keeps only its queries here; see `block_roots`."""
+        """Root of every cached block for one task: `{split}/{subset}/{side}` below."""
         return self.encode_directory / task_name
-
-    def block_roots(self, task_name: str) -> tuple[Path, ...]:
-        """Every directory holding `task_name`'s blocks (`task_block_roots`)."""
-        return task_block_roots(self.encode_directory, task_name)
 
     def _cache_path(
         self, task_name: str, hf_split: str, hf_subset: str, side: str
     ) -> Path:
-        owner = corpus_directory_name(task_name) if side == "document" else task_name
-        return self.encode_directory / owner / hf_split / hf_subset / side
+        return self.task_directory(task_name) / hf_split / hf_subset / side
 
     def _get_cache(self, path: Path) -> GeoPresCache:
         if path not in self._caches:

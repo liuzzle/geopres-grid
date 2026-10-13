@@ -97,7 +97,8 @@ def test_estimate_task_counts_legacy_clustering_sentences_across_subsets():
     assert estimate_task(task, backbone)["queries"] == 8
 
 
-def test_totals_count_a_shared_corpus_once():
+def test_totals_count_every_task_corpus():
+    """FEVER and ClimateFEVER each store their corpus (`cache.CORPUS_COPIES`)."""
     from scripts.estimate_cache_size import totals
 
     backbone = SimpleNamespace(key="fake", native_dim=2)
@@ -112,9 +113,9 @@ def test_totals_count_a_shared_corpus_once():
     rows = [estimate_task(task(name, n), backbone) for name, n in (("FEVER", 10), ("ClimateFEVER", 12), ("NQ", 5))]
     result = totals(rows)
 
-    assert [row["corpus"] for row in rows] == ["corpus-fever-wikipedia", "corpus-fever-wikipedia", "NQ"]
-    assert result["fake"]["document_bytes"] == (12 + 5) * 2 * 4
+    assert result["fake"]["document_bytes"] == (10 + 12 + 5) * 2 * 4
     assert result["fake"]["query_bytes"] == 3 * 2 * 4
+    assert result["fake"]["total_bytes"] == (27 + 3) * 2 * 4
     assert result["all"] == result["fake"]
 
 

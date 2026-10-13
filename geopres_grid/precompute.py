@@ -24,7 +24,7 @@ from mteb.abstasks.aggregated_task import AbsTaskAggregate
 from mteb.types import PromptType
 
 from geopres_grid.backbones import Backbone
-from geopres_grid.cache import CachedBackbone
+from geopres_grid.cache import CORPUS_COPIES, CachedBackbone, copy_document_blocks
 from geopres_grid.identity import EncodeConfig
 
 
@@ -55,6 +55,9 @@ def precompute_task_cache(
 
     Defaults to every evaluation split and subset the task declares; NanoBEIR's
     only split is `train`, MSMARCO's is `dev`, so no single default name is right.
+    A task in `cache.CORPUS_COPIES` (ClimateFEVER) first copies its source's
+    finished document blocks, so only the passages the source lacks are encoded;
+    without a finished source it encodes everything, which is slower, not wrong.
     Returns a compact summary that is useful for CLI output and tests.
     """
     # No-op for tasks already in the v2 `task.dataset[subset][split]` layout; the
@@ -64,6 +67,15 @@ def precompute_task_cache(
     subsets = list(hf_subsets or task.hf_subsets)
 
     wrapper = CachedBackbone(model, backbone, encode_config, cache_root)
+    copied: list[Path] = []
+    if task.metadata.name in CORPUS_COPIES:
+        copied = copy_document_blocks(
+            wrapper.encode_directory,
+            CORPUS_COPIES[task.metadata.name],
+            task.metadata.name,
+            splits=splits,
+            subsets=subsets,
+        )
     documents = queries = 0
     try:
         for subset in subsets:
@@ -107,4 +119,5 @@ def precompute_task_cache(
         "queries": queries,
         "cache_root": str(Path(cache_root)),
         "newly_encoded": wrapper.newly_encoded,
+        "copied_blocks": [str(path) for path in copied],
     }

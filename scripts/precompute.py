@@ -17,7 +17,7 @@ import sys
 from sentence_transformers import SentenceTransformer
 
 from geopres_grid.backbones import PRIMARY_MAX_SEQ_LENGTH, get, require_runnable
-from geopres_grid.cache import CachedBackbone
+from geopres_grid.cache import CORPUS_COPIES, CachedBackbone
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, resolve_device
 from geopres_grid.evaluation import TIER_TASKS, baseline_pass, load_tasks, task_names
 from geopres_grid.identity import EncodeConfig
@@ -106,6 +106,13 @@ def main(argv: list[str] | None = None) -> int:
                 hf_subsets=args.subset,
                 batch_size=args.batch_size,
             )
+            for block in summary["copied_blocks"]:
+                print(f"Copied and verified {block} from {CORPUS_COPIES[summary['task']]}")
+            if summary["task"] in CORPUS_COPIES and not summary["copied_blocks"]:
+                print(
+                    f"Nothing copied from {CORPUS_COPIES[summary['task']]}: its blocks were not "
+                    f"finished, or {summary['task']} already had its own"
+                )
             print(
                 f"Precomputed {summary['documents']} documents and {summary['queries']} queries "
                 f"for {summary['task']} ({summary['splits']}/{summary['subsets']}), "

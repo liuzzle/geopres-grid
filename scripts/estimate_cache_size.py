@@ -6,9 +6,9 @@ clustering) is cached on one side, `query`, and counts the texts of its
 evaluation split -- an upper bound, since repeated texts share one row, and one
 that leaves out classification's few-shot training sample.
 
-Output is `{"rows": [...], "totals": {...}}`. A row counts its task's own corpus;
-the per-backbone totals count each corpus once, so FEVER and ClimateFEVER
-(`cache.SHARED_CORPORA`) contribute one block, sized as the larger of the two.
+Output is `{"rows": [...], "totals": {...}}`, totals per backbone and over all.
+Every task stores its own corpus, so FEVER and ClimateFEVER count it twice
+(`cache.CORPUS_COPIES` avoids encoding it twice, not storing it).
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import sys
 from typing import Any
 
 from geopres_grid.backbones import all_backbones, get
-from geopres_grid.cache import corpus_directory_name
 
 
 def _split_rows(collection: Any, split: str) -> int:
@@ -97,10 +96,8 @@ def estimate_task(task: Any, backbone: Any, split: str | None = None, itemsize: 
 def _row(task: Any, split: str, backbone: Any, itemsize: int, *, documents: int, queries: int) -> dict[str, Any]:
     document_bytes = documents * backbone.native_dim * itemsize
     query_bytes = queries * backbone.native_dim * itemsize
-    name = getattr(task, "name", None) or task.metadata.name
     return {
-        "task": name,
-        "corpus": corpus_directory_name(name),
+        "task": getattr(task, "name", None) or task.metadata.name,
         "split": split,
         "backbone": backbone.key,
         "dimension": backbone.native_dim,
@@ -114,22 +111,13 @@ def _row(task: Any, split: str, backbone: Any, itemsize: int, *, documents: int,
 
 
 def totals(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Bytes on disk per backbone and over all of them (`"all"`), each corpus once.
-
-    The rows of one shared corpus are sized as their largest member: the cache
-    holds the union, which the descriptive stats put 25 rows above FEVER alone.
-    """
-    shared: dict[tuple[str, str, str], int] = {}
+    """Bytes on disk per backbone and over all of them (`"all"`)."""
+    fields = ("document_bytes", "query_bytes", "total_bytes")
     result: dict[str, dict[str, int]] = {}
     for row in rows:
-        total = result.setdefault(row["backbone"], {"document_bytes": 0, "query_bytes": 0, "total_bytes": 0})
-        total["query_bytes"] += row["query_bytes"]
-        key = (row["backbone"], row["corpus"], row["split"])
-        shared[key] = max(shared.get(key, 0), row["document_bytes"])
-    for (backbone, _, _), document_bytes in shared.items():
-        result[backbone]["document_bytes"] += document_bytes
-    for total in result.values():
-        total["total_bytes"] = total["document_bytes"] + total["query_bytes"]
+        total = result.setdefault(row["backbone"], dict.fromkeys(fields, 0))
+        for field in fields:
+            total[field] += row[field]
     result["all"] = {
         field: sum(total[field] for total in result.values())
         for field in ("document_bytes", "query_bytes", "total_bytes")
