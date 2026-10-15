@@ -122,6 +122,14 @@ GeoPres's wide layout: a row per run, a column per task, per-type averages) to t
 results root. Result folders are named by hash; each run's configuration is in
 `runs/<run id>.json` beside them.
 
+`uv run --extra analysis python scripts/analyse_results.py <results.csv>` turns the
+tidy table into per-cell summaries and figures (retention against the fp32 baseline,
+PCA+ROR vs PCA, equal-count vs int, truncation vs random selection, the best cell per
+storage budget, per-task changes) in `analysis/` next to the input; `--no-plots`
+needs no matplotlib. `scripts/check_pca_centring.py` measures, on one task's cached
+vectors, how much of PCA's loss comes from its mean shift. Tables in
+`geopres_grid/analysis.py`, figures in `geopres_grid/plots.py`.
+
 Per task, `evaluate.py` runs a warm-up pass (the backbone's fp32 baseline), fits PCA
 and the quantization table once on up to 10,000 of that task's cached embeddings, and
 then scores the cell -- the calibration protocol of Kisako et al. (arXiv:2606.01074,

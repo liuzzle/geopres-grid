@@ -387,6 +387,7 @@ requires-dist = [
     { name = "datasets" },
     { name = "flash-attn", marker = "extra == 'flash-attn'", specifier = ">=2.5.0" },
     { name = "huggingface-hub", specifier = ">=0.34.0,<1.0" },
+    { name = "matplotlib", marker = "extra == 'analysis'" },
     { name = "mteb", specifier = "==2.15.1" },
     { name = "numpy" },
     { name = "pandas" },
@@ -402,7 +403,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = "==4.56.0" },
 ]
-provides-extras = ["spearman", "flash-attn"]
+provides-extras = ["spearman", "flash-attn", "analysis"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]

@@ -32,6 +32,9 @@ dependencies = [
 # See README -> "torchsort".
 spearman = ["torchsort"]
 flash-attn = ["flash-attn>=2.5.0"]
+# Figures for scripts/analyse_results.py and scripts/check_pca_centring.py. Only the
+# analysis needs it; grid and precompute jobs run without.
+analysis = ["matplotlib"]
 
 [dependency-groups]
 dev = ["pytest"]

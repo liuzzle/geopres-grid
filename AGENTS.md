@@ -85,6 +85,8 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
 - Tests live in `tests/` and run with `uv run pytest`. The upstream repo had no test
   suite and its AGENTS.md said not to add one; that does not apply here. The cache
   correctness test is a required deliverable of work package C.
+- Do not perform any commits, I will check the code first, only tell me what groups should be committed and a appropriate short and simple commit message draft.
+- Log everything you do + reasoning in `logging.md`
 
 ## Things that will bite
 
