@@ -282,7 +282,7 @@ def prefix_gap(gap: pd.DataFrame):
     _dim_axis(axis, dims)
     axis.set_xlabel("Kept dimensions")
     axis.set_ylabel("Truncate minus random selection (pts)")
-    axis.set_title("Is the prefix privileged? (MRL, fp32)", loc="left")
+    axis.set_title("Comparison: keep first k vs. k random coordinates  (MRL, fp32)", loc="left")
     axis.legend(fontsize=8, loc="lower right")
     return figure
 
