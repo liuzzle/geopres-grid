@@ -138,6 +138,12 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   task order guarantees it; split into separate jobs, ClimateFEVER needs
   `--dependency=afterok` on FEVER, or it encodes all 5.4M passages again (the
   precompute log says `Nothing copied from FEVER`).
+- **PCA cells add the projected mean back before cosine** (`pca_mean="restore"`, the
+  default since 19.10). Centring stays in the fit and in the quantizer's input; only
+  the similarity is uncentred. Tier-1 PCA results were scored with the mean
+  subtracted and are `pca_mean="subtract"` cells -- do not mix the two in one table
+  (`analysis.one_pca_mean`). `Binary` dequantizes to ±1, so the mean is added on its
+  `reconstruction_scale`; any new quantizer whose levels are not input values needs one.
 - **Whether a quantizer shares one grid across coordinates decides how much PCA+ROR
   matters.** `EqualCount` (Kisako et al. §3.4: one global table) and `Binary` share
   one; `UniformAffine` fits a range per dimension and absorbs most of PCA's variance

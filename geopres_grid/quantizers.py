@@ -25,6 +25,11 @@ from geopres_grid.identity import PostProcConfig
 
 class Quantizer(ABC):
     bits_per_dim: int
+    reconstruction_scale: float = 1.0
+    """Factor that puts `dequantize`'s output on the scale of `fit`'s input. 1 for
+    every quantizer whose levels are input values; `Binary` returns ±1 and fits it.
+    Cosine ignores it, so it matters only where a vector on the input's scale is
+    added afterwards (`PostProcessingPipeline.finish`, the PCA mean)."""
 
     @abstractmethod
     def fit(self, values: np.ndarray) -> None:
@@ -137,7 +142,10 @@ class Binary(Quantizer):
     bits_per_dim = 1
 
     def fit(self, values: np.ndarray) -> None:
-        del values
+        # One scalar, so still one shared grid: the least-squares s in
+        # values ~ s * sign(values) is the mean absolute value. `dequantize` keeps
+        # returning ±1, so no score that ignores the scale changes.
+        self.reconstruction_scale = float(np.mean(np.abs(np.asarray(values, dtype=np.float32))))
 
     def quantize(self, values: np.ndarray) -> np.ndarray:
         return (np.asarray(values) >= 0).astype(np.int8)
@@ -146,12 +154,15 @@ class Binary(Quantizer):
         return np.where(np.asarray(quantized) != 0, 1.0, -1.0).astype(np.float32)
 
     def save(self, path: str | Path) -> None:
-        np.savez(path)
+        np.savez(path, reconstruction_scale=np.float32(self.reconstruction_scale))
 
     @classmethod
     def load(cls, path: str | Path) -> "Binary":
-        np.load(path)
-        return cls()
+        state = np.load(path)
+        quantizer = cls()
+        if "reconstruction_scale" in state:  # absent from tables saved before §29
+            quantizer.reconstruction_scale = float(state["reconstruction_scale"])
+        return quantizer
 
 
 class FP16(Quantizer):

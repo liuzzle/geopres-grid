@@ -203,7 +203,10 @@ def test_cell_applies_the_fitted_pipeline_and_table(tmp_path):
     result = encode(cell, DOCUMENTS, "document")
 
     raw = encode(cached, DOCUMENTS, "document")
-    expected = fake_quantize(fitted.pipeline.transform(raw), fitted.quantizers["document"])
+    quantizer = fitted.quantizers["document"]
+    expected = fitted.pipeline.finish(
+        fake_quantize(fitted.pipeline.transform(raw), quantizer), quantizer.reconstruction_scale
+    )
     np.testing.assert_array_equal(result, expected)
     assert result.shape == (40, 4)
     assert fitted.quantizers["query"] is fitted.quantizers["document"]

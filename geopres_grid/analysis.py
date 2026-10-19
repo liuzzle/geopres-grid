@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from geopres_grid.backbones import all_backbones
+from geopres_grid.identity import PCA_METHODS
 from geopres_grid.reducers import PCA, RandomSelection, Truncate
 
 QUANT_ORDER: tuple[str, ...] = (
@@ -50,13 +51,37 @@ def backbone_order(frame: pd.DataFrame) -> list[str]:
     return ordered + sorted(present - set(ordered))
 
 
-def scored_rows(frame: pd.DataFrame, task_type: str = "Retrieval") -> pd.DataFrame:
+def one_pca_mean(frame: pd.DataFrame, pca_mean: str | None = None) -> pd.DataFrame:
+    """Keep the PCA cells of one `pca_mean` mode (§29), and every other row.
+
+    Every table here keys a cell on (backbone, method, dimension, quantizer), so
+    restored and subtracted PCA cells side by side would be averaged into one.
+    Without `pca_mean`, a frame holding both modes is refused. A table from before
+    the column existed, or a PCA row without a mode, is a subtracted PCA cell.
+    """
+    frame = frame.copy()
+    is_pca = frame["dr_method"].isin(PCA_METHODS)
+    if "pca_mean" not in frame.columns:
+        frame["pca_mean"] = None
+    frame["pca_mean"] = frame["pca_mean"].astype(object)
+    frame.loc[is_pca & frame["pca_mean"].isna(), "pca_mean"] = "subtract"
+    modes = set(frame.loc[is_pca, "pca_mean"].dropna())
+    if pca_mean is None:
+        if len(modes) > 1:
+            raise ValueError(f"PCA cells in both pca_mean modes {sorted(modes)}; choose one")
+        return frame
+    return frame[~is_pca | (frame["pca_mean"] == pca_mean)]
+
+
+def scored_rows(frame: pd.DataFrame, task_type: str = "Retrieval", pca_mean: str | None = None) -> pd.DataFrame:
     """Rows of one task type, each with its baseline score, delta and retention.
 
     `target_dim` becomes 0 for the no-DR rows, so it can be a groupby key. A run
     with no baseline for its (backbone, task, split, subset) raises: retention
-    against a missing baseline would silently drop the row.
+    against a missing baseline would silently drop the row. PCA cells of one
+    `pca_mean` mode only (`one_pca_mean`).
     """
+    frame = one_pca_mean(frame, pca_mean)
     rows = frame[frame["task_type"] == task_type].copy()
     rows["target_dim"] = rows["target_dim"].fillna(0).astype(int)
     keys = list(SCORE_KEYS)

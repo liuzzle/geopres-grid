@@ -106,6 +106,13 @@ class PCA(Reducer):
             raise RuntimeError("PCA must be fitted before transform")
         return (np.asarray(values, dtype=np.float32) - self.mean_) @ self.components_.T
 
+    def projected_mean(self) -> np.ndarray:
+        """The fitted mean in the output space: what `transform` subtracted, so
+        `transform(x) + projected_mean()` is the uncentred projection of `x`."""
+        if self.components_ is None or self.mean_ is None:
+            raise RuntimeError("PCA must be fitted before projected_mean")
+        return self.mean_ @ self.components_.T
+
     def save(self, path: str | Path) -> None:
         if self.components_ is None or self.mean_ is None:
             raise RuntimeError("PCA must be fitted before save")
@@ -138,6 +145,11 @@ class PCARotation(PCA):
         if self.rotation_ is None:
             raise RuntimeError("PCARotation must be fitted before transform")
         return projected @ self.rotation_.T
+
+    def projected_mean(self) -> np.ndarray:
+        if self.rotation_ is None:
+            raise RuntimeError("PCARotation must be fitted before projected_mean")
+        return super().projected_mean() @ self.rotation_.T
 
     def save(self, path: str | Path) -> None:
         if self.components_ is None or self.mean_ is None or self.rotation_ is None:
@@ -266,7 +278,17 @@ def apply_reduction(
 
 
 class PostProcessingPipeline:
-    """Fit and apply one configured reducer to cached embedding arrays."""
+    """Fit and apply one configured reducer to cached embedding arrays.
+
+    Two halves around the quantizer: `transform` gives the quantizer's input,
+    `finish` turns the dequantized values into the vectors that are scored. For
+    every cell but a mean-restoring PCA (`PostProcConfig.pca_mean == "restore"`),
+    `transform` is `normalize -> reduce -> normalize` and `finish` returns its
+    input unchanged. A mean-restoring PCA quantizes the centred projection as it
+    comes out -- not renormalised, because the mean is added back on that scale --
+    and `finish` adds the projected mean (rotated, for `pca_ror`) and then
+    normalises, so scores use the uncentred projection's geometry.
+    """
 
     def __init__(
         self,
@@ -281,6 +303,10 @@ class PostProcessingPipeline:
         )
         self._fitted = False
 
+    @property
+    def restores_mean(self) -> bool:
+        return self.config.pca_mean == "restore"
+
     def fit(self, values: np.ndarray) -> None:
         prepared = (
             _unit_norm(values)
@@ -291,14 +317,27 @@ class PostProcessingPipeline:
         self._fitted = True
 
     def transform(self, values: np.ndarray) -> np.ndarray:
+        """The quantizer's input."""
         if not self._fitted:
             raise RuntimeError("PostProcessingPipeline must be fitted before transform")
         return apply_reduction(
             values,
             self.reducer,
             normalize_before=self.config.normalize_before,
-            normalize_after=self.config.normalize_after,
+            normalize_after=self.config.normalize_after and not self.restores_mean,
         )
+
+    def finish(self, dequantized: np.ndarray, reconstruction_scale: float = 1.0) -> np.ndarray:
+        """The vectors to score, from the quantizer's dequantized output.
+
+        `reconstruction_scale` is the quantizer's (`Quantizer.reconstruction_scale`):
+        the mean is added on the scale `transform` produced, which ±1 binary codes
+        are not on.
+        """
+        if not self.restores_mean:
+            return dequantized
+        restored = reconstruction_scale * np.asarray(dequantized, dtype=np.float32) + self.reducer.projected_mean()
+        return _unit_norm(restored) if self.config.normalize_after else restored
 
 
 def reducer_from_config(

@@ -114,3 +114,16 @@ def test_centring_check_full_rank_uncentred_is_exact_and_centring_shifts_a_cone(
     assert table.loc[16, "truncate"] == pytest.approx(1.0)
     assert table.loc[16, "pca_centred"] < 1.0
     assert table.attrs["mean_norm"] > 0.5
+
+
+def test_pca_cells_of_both_mean_modes_are_never_averaged_together():
+    old = make_frame()  # written before the column existed: all PCA cells subtracted
+    restored = old[old["dr_method"].isin(["pca", "pca_ror"])].assign(pca_mean="restore", main_score=0.1)
+    both = pd.concat([old.assign(pca_mean=None), restored])
+
+    with pytest.raises(ValueError, match="both pca_mean modes"):
+        analysis.scored_rows(both)
+    kept = analysis.scored_rows(both, pca_mean="restore")
+    assert (kept.loc[kept["dr_method"] == "pca", "main_score"] == 0.1).all()
+    assert len(kept[kept["dr_method"] == "truncate"]) == 4
+    assert set(analysis.scored_rows(old)["pca_mean"].dropna()) == {"subtract"}

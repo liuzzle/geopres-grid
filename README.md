@@ -96,6 +96,13 @@ model's native dimension), each with `none`, `fp16`, `int8`, `int4`, `int2`,
 `binary` and `equal_count_{8,4,2}`. That is 189 cells per backbone; GeoPres runs
 separately once its projections are trained.
 
+PCA cells (`pca`, `pca_ror`) centre to fit the directions and to quantize, then add
+the projected mean back before cosine (`PostProcConfig.pca_mean="restore"`), so they
+score in the uncentred projection's geometry. Tier 1 was scored with the mean left
+subtracted; those cells keep their run ids as `pca_mean="subtract"`
+(`--pca-mean subtract` in `run_grid.py` / `evaluate.py`). `analyse_results.py
+--pca-mean` picks one mode when a table holds both.
+
 ```bash
 scripts/slurm/submit_grid.sh harrier-270m tier1     # cluster: baselines, then the cells (CPU)
 uv run python scripts/run_grid.py --backbone harrier-270m --tier tier0   # locally, one process

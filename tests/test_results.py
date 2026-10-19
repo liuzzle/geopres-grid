@@ -152,3 +152,16 @@ def test_a_run_record_is_replaced_whole_and_leaves_no_temporary_file(tmp_path):
 
     assert json.loads(path.read_text())["value"] == 2
     assert [p.name for p in (tmp_path / RUNS_DIRECTORY).iterdir()] == ["abc.json"]
+
+
+def test_pca_mean_column_reads_old_records_as_subtracted(tmp_path):
+    root, _, cell_record = make_results(tmp_path)
+    old = dict(cell_record, postproc={k: v for k, v in cell_record["postproc"].items() if k != "pca_mean"})
+    write_run_record(root, old)
+
+    frame = load_results(root)
+
+    cell = frame[frame["run_id"] == cell_record["revision"]]
+    assert set(cell["pca_mean"]) == {"subtract"}
+    assert frame.loc[frame["kind"] == "baseline", "pca_mean"].isna().all()
+    assert cell_record["postproc"]["pca_mean"] == "restore"

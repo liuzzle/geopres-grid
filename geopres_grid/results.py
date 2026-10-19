@@ -34,6 +34,7 @@ from typing import Any
 import pandas as pd
 
 from geopres_grid.backbones import all_backbones
+from geopres_grid.identity import PCA_METHODS
 
 RESULTS_DIRECTORY = "results"
 RUNS_DIRECTORY = "runs"
@@ -47,6 +48,7 @@ CONFIG_COLUMNS = (
     "dr_method",
     "target_dim",
     "dr_seed",
+    "pca_mean",
     "dr_weights_id",
     "quant_method",
     "quant_symmetric",
@@ -103,6 +105,9 @@ def _config_columns(record: dict[str, Any]) -> dict[str, Any]:
         "dr_method": postproc.get("dr_method", "none"),
         "target_dim": postproc.get("target_dim"),
         "dr_seed": postproc.get("dr_seed"),
+        # Records written before §29 have no `pca_mean`; their PCA cells subtracted it.
+        "pca_mean": postproc.get("pca_mean")
+        or ("subtract" if postproc.get("dr_method") in PCA_METHODS else None),
         "dr_weights_id": postproc.get("dr_weights_id"),
         "quant_method": postproc.get("quant_method", "none"),
         "quant_symmetric": postproc.get("quant_symmetric", True),

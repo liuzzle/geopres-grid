@@ -171,3 +171,24 @@ def test_symmetry_ablation_is_exact_without_quantization():
     for values in scores.values():
         assert values["spearman"] == pytest.approx(1.0)
         assert values["recall@5"] == pytest.approx(1.0)
+
+
+def test_binary_fits_its_least_squares_scale_and_keeps_its_codes(tmp_path):
+    from geopres_grid.quantizers import Binary
+
+    values = np.array([[0.5, -0.1], [-0.3, 0.3]], dtype=np.float32)
+    quantizer = Binary()
+    quantizer.fit(values)
+
+    assert quantizer.reconstruction_scale == pytest.approx(0.3)
+    np.testing.assert_array_equal(quantizer.dequantize(quantizer.quantize(values)), [[1, -1], [-1, 1]])
+    quantizer.save(tmp_path / "binary.npz")
+    assert Binary.load(tmp_path / "binary.npz").reconstruction_scale == pytest.approx(0.3)
+    np.savez(tmp_path / "old.npz")  # a table saved before the scale existed
+    assert Binary.load(tmp_path / "old.npz").reconstruction_scale == 1.0
+
+
+def test_value_quantizers_reconstruct_on_the_input_scale():
+    values = np.random.default_rng(0).normal(size=(200, 4)).astype(np.float32)
+    for method in ("none", "fp16", "int8", "equal_count_4"):
+        assert fit_quantizer(PostProcConfig(quant_method=method), values).reconstruction_scale == 1.0

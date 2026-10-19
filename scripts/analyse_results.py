@@ -42,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, help="Output directory (default: <results dir>/analysis)")
     parser.add_argument("--task-type", default="Retrieval")
     parser.add_argument("--no-plots", action="store_true", help="Tables only; no matplotlib needed")
+    parser.add_argument(
+        "--pca-mean",
+        choices=("restore", "subtract"),
+        help="Which PCA cells to analyse when the table holds both (logging §29)",
+    )
     return parser
 
 
@@ -51,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     frame = pd.read_csv(args.results)
-    rows = analysis.scored_rows(frame, task_type=args.task_type)
+    rows = analysis.scored_rows(frame, task_type=args.task_type, pca_mean=args.pca_mean)
     other = frame[frame["task_type"] != args.task_type]
     cells = analysis.cell_summary(rows)
 

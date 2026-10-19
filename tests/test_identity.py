@@ -246,9 +246,29 @@ def test_default_seed_and_omitted_seed_are_one_configuration():
 
 
 def test_existing_run_ids_are_unchanged():
-    """The 04.10 harrier-270m cells. The seed and weights fields must not move them."""
-    assert PostProcConfig(dr_method="pca", target_dim=128, quant_method="int4").hash == "33dfe7bbaee5a815"
-    assert PostProcConfig(dr_method="pca_ror", target_dim=128).hash == "c3e71e921b1ec653"
+    """The 04.10 harrier-270m cells. The seed, weights and pca_mean fields must not move
+    them: they subtracted the mean, so that is the mode that keeps their ids."""
+    assert (
+        PostProcConfig(dr_method="pca", target_dim=128, quant_method="int4", pca_mean="subtract").hash
+        == "33dfe7bbaee5a815"
+    )
+    assert PostProcConfig(dr_method="pca_ror", target_dim=128, pca_mean="subtract").hash == "c3e71e921b1ec653"
+    assert PostProcConfig(dr_method="truncate", target_dim=128, quant_method="int4").pca_mean is None
+
+
+def test_pca_restores_the_mean_by_default_under_a_new_run_id():
+    restored = PostProcConfig(dr_method="pca", target_dim=128, quant_method="int4")
+    assert restored.pca_mean == "restore"
+    assert restored == PostProcConfig(dr_method="pca", target_dim=128, quant_method="int4", pca_mean="restore")
+    assert restored.hash != "33dfe7bbaee5a815"
+    assert PostProcConfig(dr_method="pca_ror", target_dim=128).hash != "c3e71e921b1ec653"
+
+
+def test_pca_mean_is_only_for_pca_methods_and_only_two_modes():
+    with pytest.raises(ValueError, match="pca_mean"):
+        PostProcConfig(dr_method="truncate", target_dim=64, pca_mean="restore")
+    with pytest.raises(ValueError, match="pca_mean"):
+        PostProcConfig(dr_method="pca", target_dim=64, pca_mean="centre")
 
 
 def test_a_seed_for_a_method_without_randomness_is_rejected():

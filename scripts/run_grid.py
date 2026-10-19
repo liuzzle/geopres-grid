@@ -30,7 +30,7 @@ from geopres_grid.cache import CachedBackbone, resolve_encode_config
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH
 from geopres_grid.evaluation import TIER_TASKS, PostProcessedBackbone, baseline_pass, evaluate_cell, load_tasks, task_names
 from geopres_grid.grid import GRID_DR_METHODS, GRID_QUANT_METHODS, GRID_TARGET_DIMS, grid_cells, shard
-from geopres_grid.identity import BITS_PER_DIM, DR_METHODS
+from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, PCA_MEAN_MODES
 from geopres_grid.precompute import leaf_tasks
 
 
@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dr-method", action="append", choices=DR_METHODS, help=f"Restrict; default {GRID_DR_METHODS}")
     parser.add_argument("--target-dim", action="append", type=int, help=f"Restrict; default {GRID_TARGET_DIMS}")
     parser.add_argument("--quant-method", action="append", choices=sorted(BITS_PER_DIM), help=f"Restrict; default {GRID_QUANT_METHODS}")
+    parser.add_argument(
+        "--pca-mean",
+        choices=PCA_MEAN_MODES,
+        help="pca/pca_ror cells: restore the projected mean before cosine (default) or keep it subtracted (tier 1)",
+    )
     parser.add_argument("--shard", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
     parser.add_argument("--num-shards", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1)))
     parser.add_argument("--max-seq-length", type=int, default=PRIMARY_MAX_SEQ_LENGTH)
@@ -62,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             dr_methods=args.dr_method or GRID_DR_METHODS,
             target_dims=args.target_dim or GRID_TARGET_DIMS,
             quant_methods=args.quant_method or GRID_QUANT_METHODS,
+            pca_mean=args.pca_mean,
         ),
         args.shard,
         args.num_shards,

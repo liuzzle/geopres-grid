@@ -326,6 +326,13 @@ def weights_id(weights: Any) -> str:
     return digest.hexdigest()[:HASH_LENGTH]
 
 
+PCA_METHODS = ("pca", "pca_ror")
+"""Methods that centre on a fitted mean, and so the only ones `pca_mean` applies to."""
+
+PCA_MEAN_MODES = ("restore", "subtract")
+"""What a PCA cell does with the fitted mean after projecting (`PostProcConfig.pca_mean`)."""
+
+
 DR_METHODS = (
     "none",
     "truncate",
@@ -361,6 +368,14 @@ class PostProcConfig:
     """`weights_id` of the trained projection, required by `geopres` and only there.
     Without it two different projections at one `target_dim` share a run id, and so
     one MTEB result slot. Hashed only when set, so no other run id changes."""
+    pca_mean: str | None = None
+    """`PCA_METHODS` only. `"restore"` (the default for them): vectors are centred
+    and projected, quantized centred, and the projected mean is added back after
+    dequantization, so cosine is taken in the uncentred projection's geometry --
+    centring is part of fitting the directions and of the quantizer's input, not
+    of the similarity (logging §23.2, §29). `"subtract"`: the mean stays
+    subtracted, the behaviour of every tier-1 PCA run. Hashed only when
+    `"restore"`, so a `"subtract"` cell keeps the run id it was scored under."""
     normalize_after: bool = True
     quant_method: str = "none"
     quant_symmetric: bool = True
@@ -388,6 +403,13 @@ class PostProcConfig:
             raise ValueError(f"dr_method={self.dr_method!r} takes no dr_seed")
         if (self.dr_method == "geopres") != (self.dr_weights_id is not None):
             raise ValueError("dr_weights_id is required by dr_method='geopres', and only there")
+        if self.dr_method in PCA_METHODS:
+            if self.pca_mean is None:
+                object.__setattr__(self, "pca_mean", "restore")
+            if self.pca_mean not in PCA_MEAN_MODES:
+                raise ValueError(f"pca_mean must be one of {PCA_MEAN_MODES}, got {self.pca_mean!r}")
+        elif self.pca_mean is not None:
+            raise ValueError(f"dr_method={self.dr_method!r} has no mean; pca_mean applies to {PCA_METHODS}")
 
     @property
     def is_identity(self) -> bool:
@@ -415,6 +437,8 @@ class PostProcConfig:
         }
         if self.dr_weights_id is not None:
             payload["dr_weights_id"] = self.dr_weights_id
+        if self.pca_mean == "restore":
+            payload["pca_mean"] = self.pca_mean
         return config_hash(payload)
 
     @property

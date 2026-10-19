@@ -17,7 +17,7 @@ import numpy as np
 from geopres_grid.backbones import get
 from geopres_grid.cache import backbone_cache_root, resolve_encode_config
 from geopres_grid.evaluation import CALIBRATION_MAX_ROWS, CALIBRATION_SEED, cached_blocks, sample_rows
-from geopres_grid.identity import DR_METHODS, PostProcConfig
+from geopres_grid.identity import DR_METHODS, PCA_METHODS, PostProcConfig
 from geopres_grid.quantizers import calibration_symmetry_ablation
 from geopres_grid.reducers import PostProcessingPipeline
 
@@ -61,7 +61,11 @@ def main(argv: list[str] | None = None) -> int:
     if not blocks["query"] or not blocks["document"]:
         raise SystemExit(f"{args.task} needs cached query and document blocks")
 
-    dr = PostProcConfig(dr_method=args.dr_method, target_dim=args.target_dim, dr_seed=args.dr_seed)
+    # The ablation scores quantization against the reduced fp32 vectors themselves,
+    # so where the PCA mean goes is not what it measures; "subtract" keeps the
+    # quantizer's input the unit vectors it was run on (logging §29).
+    pca_mean = "subtract" if args.dr_method in PCA_METHODS else None
+    dr = PostProcConfig(dr_method=args.dr_method, target_dim=args.target_dim, dr_seed=args.dr_seed, pca_mean=pca_mean)
     calibration = sample_rows(blocks["query"] + blocks["document"], CALIBRATION_MAX_ROWS, CALIBRATION_SEED)
     pipeline = PostProcessingPipeline(dr, calibration.shape[1])
     pipeline.fit(calibration)
@@ -73,7 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'method':<15}{'variant':<23}{'spearman':>10}{f'recall@{args.k}':>12}")
     for method in args.quant_method or DEFAULT_METHODS:
         config = PostProcConfig(
-            dr_method=args.dr_method, target_dim=args.target_dim, dr_seed=args.dr_seed, quant_method=method
+            dr_method=args.dr_method,
+            target_dim=args.target_dim,
+            dr_seed=args.dr_seed,
+            pca_mean=pca_mean,
+            quant_method=method,
         )
         scores = calibration_symmetry_ablation(config, queries, documents, k=args.k)
         for variant, values in scores.items():

@@ -124,3 +124,93 @@ def test_geopres_weights_must_match_the_configured_weights_id():
 
     with pytest.raises(ValueError, match="dr_weights_id"):
         reducer_from_config(config, 8, geopres_weights=weights + 1)
+
+
+def cone(rows=300, dim=16, seed=0):
+    """Unit vectors in a narrow cone, like the backbones' (||mean|| well above 0)."""
+    generator = np.random.default_rng(seed)
+    values = generator.normal(size=(rows, dim)) * 0.4 + 1.0
+    return values / np.linalg.norm(values, axis=1, keepdims=True)
+
+
+def cosine(a, b):
+    a = a / np.linalg.norm(a, axis=1, keepdims=True)
+    b = b / np.linalg.norm(b, axis=1, keepdims=True)
+    return a @ b.T
+
+
+@pytest.mark.parametrize("method", ["pca", "pca_ror"])
+def test_restored_pca_scores_in_the_uncentred_projection(method):
+    values = cone()
+    pipeline = PostProcessingPipeline(PostProcConfig(dr_method=method, target_dim=6), 16)
+    pipeline.fit(values)
+
+    scored = pipeline.finish(pipeline.transform(values))
+
+    uncentred = values @ pipeline.reducer.components_.T
+    np.testing.assert_allclose(cosine(scored, scored), cosine(uncentred, uncentred), atol=1e-5)
+    np.testing.assert_allclose(np.linalg.norm(scored, axis=1), 1.0, atol=1e-6)
+    centred = PostProcessingPipeline(PostProcConfig(dr_method=method, target_dim=6, pca_mean="subtract"), 16)
+    centred.fit(values)
+    old = centred.transform(values)
+    assert np.abs(cosine(old, old) - cosine(uncentred, uncentred)).max() > 0.1  # what §23.2 found
+
+
+def test_restored_pca_and_pca_ror_agree_at_fp32():
+    values = cone()
+    scores = []
+    for method in ("pca", "pca_ror"):
+        pipeline = PostProcessingPipeline(PostProcConfig(dr_method=method, target_dim=6), 16)
+        pipeline.fit(values)
+        out = pipeline.finish(pipeline.transform(values))
+        scores.append(out @ out.T)
+    np.testing.assert_allclose(scores[0], scores[1], atol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["pca", "pca_ror"])
+def test_restored_pca_hands_the_quantizer_centred_values(method):
+    values = cone()
+    pipeline = PostProcessingPipeline(PostProcConfig(dr_method=method, target_dim=6), 16)
+    pipeline.fit(values)
+
+    quantizer_input = pipeline.transform(values)
+
+    np.testing.assert_allclose(quantizer_input.mean(axis=0), 0.0, atol=1e-5)
+    np.testing.assert_allclose(
+        quantizer_input + pipeline.reducer.projected_mean(),
+        pipeline.reducer.transform(values) + pipeline.reducer.projected_mean(),
+        atol=1e-6,
+    )
+    assert not np.allclose(np.linalg.norm(quantizer_input, axis=1), 1.0)  # not renormalised
+
+
+def test_restore_puts_the_mean_on_the_reconstruction_scale():
+    values = cone()
+    pipeline = PostProcessingPipeline(PostProcConfig(dr_method="pca", target_dim=6), 16)
+    pipeline.fit(values)
+    codes = np.sign(pipeline.transform(values))
+
+    restored = pipeline.finish(codes, 0.25)
+
+    expected = 0.25 * codes + pipeline.reducer.projected_mean()
+    np.testing.assert_allclose(restored, expected / np.linalg.norm(expected, axis=1, keepdims=True), atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        PostProcConfig(dr_method="pca", target_dim=6, pca_mean="subtract"),
+        PostProcConfig(dr_method="truncate", target_dim=6),
+        PostProcConfig(dr_method="random_projection", target_dim=6),
+        PostProcConfig(),
+    ],
+)
+def test_every_other_cell_is_unchanged(config):
+    """`transform` is normalize -> reduce -> normalize and `finish` returns its input."""
+    values = cone()
+    pipeline = PostProcessingPipeline(config, 16)
+    pipeline.fit(values)
+    dequantized = pipeline.transform(values)
+
+    assert pipeline.finish(dequantized, 0.25) is dequantized
+    np.testing.assert_array_equal(dequantized, apply_reduction(values, pipeline.reducer))

@@ -304,7 +304,10 @@ class PostProcessedBackbone:
             **kwargs,
         )
         quantizer = fitted.quantizers[side_of(prompt_type)]
-        return fake_quantize(fitted.pipeline.transform(values), quantizer)
+        return fitted.pipeline.finish(
+            fake_quantize(fitted.pipeline.transform(values), quantizer),
+            quantizer.reconstruction_scale,
+        )
 
 
 def run_record(cached: CachedBackbone, config: PostProcConfig | None) -> dict[str, Any]:

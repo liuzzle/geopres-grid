@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from geopres_grid.backbones import Backbone
-from geopres_grid.identity import PostProcConfig
+from geopres_grid.identity import PCA_METHODS, PostProcConfig
 
 GRID_TARGET_DIMS: tuple[int, ...] = (64, 128, 256, 512)
 """Shared across backbones, so the compression factor differs per model (768, 640,
@@ -50,15 +50,22 @@ def grid_cells(
     dr_methods: Iterable[str] = GRID_DR_METHODS,
     target_dims: Iterable[int] = GRID_TARGET_DIMS,
     quant_methods: Iterable[str] = GRID_QUANT_METHODS,
+    pca_mean: str | None = None,
 ) -> list[PostProcConfig]:
     """Cells for `backbone`, in a fixed order: no DR first, then each method by
     dimension, every quantizer within. The identity cell (no DR, no quantization)
-    is included; `evaluate_cell` scores it as the baseline without a second slot."""
+    is included; `evaluate_cell` scores it as the baseline without a second slot.
+    `pca_mean` applies to the PCA methods only; None is their default, `"restore"`."""
     dims = [dim for dim in target_dims if dim < backbone.native_dim]
     reductions: list[tuple[str, int | None]] = [("none", None)]
     reductions += [(method, dim) for method in dr_methods if method != "none" for dim in dims]
     return [
-        PostProcConfig(dr_method=method, target_dim=dim, quant_method=quant)
+        PostProcConfig(
+            dr_method=method,
+            target_dim=dim,
+            quant_method=quant,
+            pca_mean=pca_mean if method in PCA_METHODS else None,
+        )
         for method, dim in reductions
         for quant in quant_methods
     ]

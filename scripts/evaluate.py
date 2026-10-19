@@ -26,7 +26,7 @@ from geopres_grid.backbones import PRIMARY_MAX_SEQ_LENGTH, Backbone, get, requir
 from geopres_grid.cache import CachedBackbone, resolve_encode_config
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, resolve_device
 from geopres_grid.evaluation import TIER_TASKS, PostProcessedBackbone, evaluate_cell, load_tasks, task_names
-from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, EncodeConfig, PostProcConfig, weights_id
+from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, PCA_MEAN_MODES, EncodeConfig, PostProcConfig, weights_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dr-method", choices=DR_METHODS, default="none")
     parser.add_argument("--target-dim", type=int)
     parser.add_argument("--dr-seed", type=int)
+    parser.add_argument(
+        "--pca-mean",
+        choices=PCA_MEAN_MODES,
+        help="pca/pca_ror only: add the projected mean back before cosine (restore, the default) "
+        "or keep it subtracted (subtract, the tier-1 behaviour)",
+    )
     parser.add_argument("--quant-method", choices=sorted(BITS_PER_DIM), default="none")
     parser.add_argument(
         "--per-side-calibration",
@@ -91,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         dr_method=args.dr_method,
         target_dim=args.target_dim,
         dr_seed=args.dr_seed,
+        pca_mean=args.pca_mean,
         dr_weights_id=weights_id(weights) if weights is not None else None,
         quant_method=args.quant_method,
         quant_symmetric=not args.per_side_calibration,
