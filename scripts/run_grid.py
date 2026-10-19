@@ -121,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             for leaf in leaves:
                 leaf.unload_data()
+            cached.close()  # this task's block indices; ~1 GB per million passages
 
     if failures:
         print(f"{len(failures)} failed:\n  " + "\n  ".join(failures))

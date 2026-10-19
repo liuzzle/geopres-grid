@@ -1,3 +1,5 @@
+import weakref
+
 import mteb
 import numpy as np
 import pandas as pd
@@ -210,6 +212,26 @@ def test_cell_applies_the_fitted_pipeline_and_table(tmp_path):
     np.testing.assert_array_equal(result, expected)
     assert result.shape == (40, 4)
     assert fitted.quantizers["query"] is fitted.quantizers["document"]
+
+
+def test_closing_the_wrapper_releases_every_block_and_the_next_encode_reloads_it(tmp_path):
+    cached = make_cached(tmp_path)
+    cell = PostProcessedBackbone(cached, PostProcConfig(dr_method="pca", target_dim=4, quant_method="int8"))
+    cell.fit_task(FakeMetadata.name, warm(cached))
+    before = encode(cell, DOCUMENTS, "document")
+    opened = [weakref.ref(block) for block in cached._caches.values()]
+    assert len(opened) == 2
+
+    cached.close()
+
+    # No gc.collect(): the index must go when the wrapper lets go, and the cell,
+    # which run_grid keeps for the whole task, must hold no reference of its own.
+    assert cached._caches == {}
+    assert [ref() for ref in opened] == [None, None]
+
+    cached._model = None  # a miss now raises, so the vectors must come from disk
+    np.testing.assert_array_equal(encode(cell, DOCUMENTS, "document"), before)
+    assert len(cached._caches) == 1
 
 
 def test_per_side_calibration_fits_one_table_per_side(tmp_path):

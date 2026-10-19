@@ -119,12 +119,15 @@ def main(argv: list[str] | None = None) -> int:
 
     selected_tasks = tuple(args.task) if args.task else task_names(args.tier)
     for task in load_tasks(selected_tasks):
-        baseline, scored = evaluate_cell(
-            cell,
-            task,
-            results_cache=results_cache,
-            encode_kwargs={"batch_size": args.batch_size},
-        )
+        try:
+            baseline, scored = evaluate_cell(
+                cell,
+                task,
+                results_cache=results_cache,
+                encode_kwargs={"batch_size": args.batch_size},
+            )
+        finally:
+            cached.close()  # this task's block indices; ~1 GB per million passages
         before = baseline.task_results[0].get_score()
         after = scored.task_results[0].get_score()
         print(f"{task.metadata.name}: fp32 {before:.4f} -> cell {after:.4f}")

@@ -648,8 +648,17 @@ class CachedBackbone:
         return len(missing_indices)
 
     def close(self) -> None:
-        for cache in getattr(self, "_caches", {}).values():
+        """Release every opened block: its memory map and its index.
+
+        A block's index (`ids.parquet` with the prompted text, plus the
+        `sha256 -> row` dict) costs about 1 GB per million passages, so a process
+        that walks several large tasks calls this after each one. The wrapper stays
+        usable: the next `encode` or `fill` reloads the block it needs from disk.
+        """
+        caches = getattr(self, "_caches", {})
+        for cache in caches.values():
             cache.close()
+        caches.clear()
 
     def __del__(self) -> None:
         self.close()
