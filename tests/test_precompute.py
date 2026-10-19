@@ -169,3 +169,83 @@ def test_leaf_tasks_expands_aggregates():
     assert len(leaves) == 12
     assert all(leaf.metadata.name.startswith("CQADupstack") for leaf in leaves)
     assert leaf_tasks(nano) == [nano]
+
+
+class KilledModel(FakeModel):
+    """Stands for a job hitting its time limit: dies on encode call `dies_on`."""
+
+    def __init__(self, dies_on):
+        super().__init__()
+        self.calls = []
+        self.dies_on = dies_on
+
+    def encode(self, texts, **kwargs):
+        self.calls.append(len(texts))
+        if len(self.calls) == self.dies_on:
+            raise KeyboardInterrupt("time limit")
+        return super().encode(texts, **kwargs)
+
+
+BIG_CORPUS = [{"id": f"d{index}", "title": "", "text": f"Passage number {index}."} for index in range(7)]
+
+
+def document_block(root, backbone, config, split="train"):
+    from geopres_grid.cache import GeoPresCache
+
+    directory = (
+        root / f"{backbone.slug}@{backbone.revision}" / config.hash / TASK_METADATA.name / split / "default" / "document"
+    )
+    cache = GeoPresCache(directory)
+    cache.load()
+    return cache
+
+
+def test_precompute_encodes_one_chunk_at_a_time(tmp_path):
+    model = KilledModel(dies_on=None)
+    lines = []
+    precompute_task_cache(
+        model=model,
+        backbone=get("mdenseon"),
+        encode_config=make_encode_config(),
+        task=FakeTask(BIG_CORPUS, QUERIES),
+        cache_root=tmp_path,
+        chunk_size=3,
+        progress=lines.append,
+    )
+
+    assert model.calls == [3, 3, 1, 1]  # three document chunks, then the query
+    assert lines[2] == f"{TASK_METADATA.name} train/default document: 7/7 cached, 1 of this chunk encoded"
+
+
+def test_killed_precompute_resumes_at_the_first_uncommitted_chunk(tmp_path):
+    backbone, config = get("mdenseon"), make_encode_config()
+    common = dict(backbone=backbone, encode_config=config, task=FakeTask(BIG_CORPUS, QUERIES), cache_root=tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        precompute_task_cache(model=KilledModel(dies_on=3), chunk_size=3, **common)
+    assert len(document_block(tmp_path, backbone, config)._ids) == 6  # two chunks committed
+
+    resumed = FakeModel()
+    precompute_task_cache(model=resumed, chunk_size=3, **common)
+
+    assert resumed.seen == ["document: Passage number 6.", "query: why do cats purr"]
+    reference_root = tmp_path / "reference"
+    precompute_task_cache(model=FakeModel(), **{**common, "cache_root": reference_root})
+    chunked = document_block(tmp_path, backbone, config)
+    unchunked = document_block(reference_root, backbone, config)
+    texts = [f"document: Passage number {index}." for index in range(7)]
+    np.testing.assert_array_equal(
+        chunked.get_vectors([{}] * 7, prompted_texts=texts)[0],
+        unchunked.get_vectors([{}] * 7, prompted_texts=texts)[0],
+    )
+
+
+def test_precompute_refuses_a_chunk_size_below_one(tmp_path):
+    with pytest.raises(ValueError, match="chunk_size"):
+        precompute_task_cache(
+            model=FakeModel(),
+            backbone=get("mdenseon"),
+            encode_config=make_encode_config(),
+            task=FakeTask(CORPUS, QUERIES),
+            cache_root=tmp_path,
+            chunk_size=0,
+        )

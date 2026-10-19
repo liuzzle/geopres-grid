@@ -21,7 +21,7 @@ from geopres_grid.cache import CORPUS_COPIES, CachedBackbone
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, resolve_device
 from geopres_grid.evaluation import TIER_TASKS, baseline_pass, load_tasks, task_names
 from geopres_grid.identity import EncodeConfig
-from geopres_grid.precompute import leaf_tasks, precompute_task_cache
+from geopres_grid.precompute import DEFAULT_CHUNK_SIZE, leaf_tasks, precompute_task_cache
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", action="append", help="Override the task's eval splits")
     parser.add_argument("--subset", action="append", help="Override the task's subsets")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Passages encoded and committed per step; a rerun resumes at the first uncommitted chunk",
+    )
     parser.add_argument("--max-seq-length", type=int, default=PRIMARY_MAX_SEQ_LENGTH)
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--device", default=None)
@@ -105,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
                 hf_splits=args.split,
                 hf_subsets=args.subset,
                 batch_size=args.batch_size,
+                chunk_size=args.chunk_size,
+                progress=lambda line: print(line, flush=True),
             )
             for block in summary["copied_blocks"]:
                 print(f"Copied and verified {block} from {CORPUS_COPIES[summary['task']]}")

@@ -1,5 +1,6 @@
 import mteb
 import numpy as np
+import pandas as pd
 import pytest
 
 from geopres_grid.backbones import get
@@ -100,10 +101,16 @@ def test_sample_rows_is_seeded_bounded_and_spans_blocks():
     )
 
 
-def write_block(root, split, side, values):
+def write_block(root, split, side, values, committed=None):
+    """A cache block whose index commits to its first `committed` rows (default all)."""
     directory = root / split / "default" / side
     directory.mkdir(parents=True)
-    np.save(directory / "embeddings.npy", np.asarray(values, dtype=np.float32))
+    values = np.asarray(values, dtype=np.float32)
+    np.save(directory / "embeddings.npy", values)
+    rows = len(values) if committed is None else committed
+    pd.DataFrame({"row_idx": range(rows), "text_hash": [str(row) for row in range(rows)]}).to_parquet(
+        directory / "ids.parquet", index=False
+    )
 
 
 def test_cached_blocks_groups_by_side_and_filters_splits(tmp_path):
@@ -117,6 +124,15 @@ def test_cached_blocks_groups_by_side_and_filters_splits(tmp_path):
     assert [len(block) for block in blocks["document"]] == [4]
     with pytest.raises(FileNotFoundError, match="warm-up"):
         cached_blocks(tmp_path / "missing")
+
+
+def test_cached_blocks_leave_out_rows_the_index_does_not_commit(tmp_path):
+    """A precompute killed between appending rows and writing the index."""
+    write_block(tmp_path, "test", "document", np.arange(6.0)[:, None], committed=4)
+
+    (block,) = cached_blocks(tmp_path)["document"]
+
+    np.testing.assert_array_equal(block[:, 0], np.arange(4.0))
 
 
 class FakeModel:

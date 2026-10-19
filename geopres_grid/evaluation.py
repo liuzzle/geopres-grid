@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from geopres_grid.cache import CachedBackbone, run_model_meta, side_of
+from geopres_grid.cache import CachedBackbone, committed_embeddings, run_model_meta, side_of
 from geopres_grid.identity import PostProcConfig, RunId
 from geopres_grid.precompute import leaf_tasks
 from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
@@ -152,6 +152,9 @@ def cached_blocks(
 ) -> dict[str, list[np.ndarray]]:
     """Memory-mapped cache blocks of one task (`CachedBackbone.task_directory`), by side.
 
+    Only committed rows (`cache.committed_embeddings`): a precompute killed mid-append
+    leaves rows past the index, which must not enter the calibration sample.
+
     Raises when the task has no cached vectors: calibration must come from a
     finished warm-up pass, never from whatever happened to be cached so far.
     """
@@ -163,7 +166,9 @@ def cached_blocks(
             continue
         if subsets and subset not in subsets:
             continue
-        blocks[side_dir.name].append(np.load(path, mmap_mode="r"))
+        vectors = committed_embeddings(side_dir)
+        if len(vectors):
+            blocks[side_dir.name].append(vectors)
     if not any(blocks.values()):
         raise FileNotFoundError(
             f"No cached embeddings under {task_directory}; "

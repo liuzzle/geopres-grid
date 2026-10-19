@@ -78,6 +78,9 @@ uv run python scripts/symmetry_ablation.py --backbone harrier-270m --task NanoAr
 ```
 
 Precompute is the only step that needs a GPU or the backbone's own environment.
+It encodes and commits `--chunk-size` passages (default 200k) at a time, so a killed
+job resumes where it stopped when run again, and memory does not grow with the
+corpus beyond the block's index (about 1 GB per million passages).
 Retrieval tasks have corpus and queries encoded directly; STS, classification and
 clustering get a baseline pass through MTEB on the GPU node, which caches exactly the
 inputs MTEB samples and stores the fp32 scores as a by-product. `evaluate.py` then

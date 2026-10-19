@@ -546,12 +546,88 @@ def test_corpus_copy_sources_are_precomputed_before_their_targets():
         assert BEIR_TASKS.index(source) < BEIR_TASKS.index(target)
 
 
-def test_a_block_whose_index_and_array_disagree_is_refused(tmp_path):
+def test_a_block_with_fewer_rows_than_its_index_is_refused(tmp_path):
     cache = GeoPresCache(tmp_path)
     cache.add([{"id": "a", "text": "a"}, {"id": "b", "text": "b"}], np.ones((2, 3)))
     cache.save()
     cache.close()
-    np.save(tmp_path / "embeddings.npy", np.ones((3, 3), dtype=np.float32))
+    np.save(tmp_path / "embeddings.npy", np.ones((1, 3), dtype=np.float32))
 
     with pytest.raises(ValueError, match="two writers"):
         GeoPresCache(tmp_path).load()
+
+
+def items(*texts):
+    return [{"id": text, "text": text} for text in texts]
+
+
+def rows(start, count, dim=3):
+    return np.arange(start * dim, (start + count) * dim, dtype=np.float32).reshape(count, dim)
+
+
+def test_add_appends_in_place_and_never_rewrites_existing_rows(tmp_path):
+    cache = GeoPresCache(tmp_path)
+    cache.add(items("a", "b"), rows(0, 2))
+    cache.save()
+    with open(tmp_path / "embeddings.npy", "r+b") as handle:  # mark row 0 on disk
+        handle.seek(-2 * 3 * 4, 2)
+        handle.write(np.full(3, -1, dtype=np.float32).tobytes())
+
+    cache.add(items("c"), rows(2, 1))
+    cache.add(items("d", "e"), rows(3, 2))
+    cache.save()
+
+    stored = np.load(tmp_path / "embeddings.npy")
+    assert stored.shape == (5, 3)
+    np.testing.assert_array_equal(stored[0], np.full(3, -1))  # survived: not rewritten
+    np.testing.assert_array_equal(stored[1:], rows(1, 4))
+    reloaded = GeoPresCache(tmp_path)
+    vectors, missing = reloaded.get_vectors(items("e", "c"), prompted_texts=["e", "c"])
+    assert not missing.any()
+    np.testing.assert_array_equal(vectors, np.vstack([rows(4, 1), rows(2, 1)]))
+
+
+def test_rows_appended_but_not_committed_are_ignored_then_overwritten(tmp_path):
+    """A job killed after `add` and before `save`: the index is the commit."""
+    cache = GeoPresCache(tmp_path)
+    cache.add(items("a", "b"), rows(0, 2))
+    cache.save()
+    cache.add(items("c", "d"), rows(2, 2))  # killed here: no save
+    assert np.load(tmp_path / "embeddings.npy", mmap_mode="r").shape == (4, 3)
+
+    resumed = GeoPresCache(tmp_path)
+    assert resumed.missing(["a", "b", "c", "d"]).tolist() == [False, False, True, True]
+    resumed.add(items("d"), rows(10, 1))
+    resumed.save()
+
+    stored = np.load(tmp_path / "embeddings.npy")
+    np.testing.assert_array_equal(stored, np.vstack([rows(0, 2), rows(10, 1)]))
+    vectors, missing = GeoPresCache(tmp_path).get_vectors(items("d"), prompted_texts=["d"])
+    assert not missing.any()
+    np.testing.assert_array_equal(vectors, rows(10, 1))
+
+
+def test_an_array_written_before_any_index_is_overwritten(tmp_path):
+    """Killed after the first chunk's array, before its index existed."""
+    cache = GeoPresCache(tmp_path)
+    cache.add(items("a", "b"), rows(0, 2))  # no save
+
+    resumed = GeoPresCache(tmp_path)
+    assert resumed.missing(["a"]).tolist() == [True]
+    resumed.add(items("x"), rows(7, 1))
+    resumed.save()
+
+    np.testing.assert_array_equal(np.load(tmp_path / "embeddings.npy"), rows(7, 1))
+
+
+def test_a_second_writer_on_one_block_is_refused(tmp_path):
+    first = GeoPresCache(tmp_path)
+    first.add(items("a"), rows(0, 1))
+    first.save()
+    second = GeoPresCache(tmp_path)
+    second.load()
+    first.add(items("b"), rows(1, 1))
+    first.save()
+
+    with pytest.raises(ValueError, match="another process"):
+        second.add(items("c"), rows(2, 1))

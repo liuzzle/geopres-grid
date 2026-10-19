@@ -17,7 +17,7 @@ pinned; this relies on its ``_create_dataloaders`` behaviour.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mteb._create_dataloaders import create_dataloader
 from mteb.abstasks.aggregated_task import AbsTaskAggregate
@@ -26,6 +26,12 @@ from mteb.types import PromptType
 from geopres_grid.backbones import Backbone
 from geopres_grid.cache import CORPUS_COPIES, CachedBackbone, copy_document_blocks
 from geopres_grid.identity import EncodeConfig
+
+
+DEFAULT_CHUNK_SIZE = 200_000
+"""Passages encoded and committed per step. Bounds precompute's memory and what
+a killed job loses; every NanoBEIR corpus fits in one chunk, so tier 1 encodes
+exactly as before (one encode call per block). At 2048-d fp32 a chunk is 1.6 GB."""
 
 
 def leaf_tasks(task: Any) -> list[Any]:
@@ -50,6 +56,8 @@ def precompute_task_cache(
     hf_splits: list[str] | None = None,
     hf_subsets: list[str] | None = None,
     batch_size: int = 32,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Populate the cache for the corpus and queries of one loaded retrieval task.
 
@@ -58,8 +66,15 @@ def precompute_task_cache(
     A task in `cache.CORPUS_COPIES` (ClimateFEVER) first copies its source's
     finished document blocks, so only the passages the source lacks are encoded;
     without a finished source it encodes everything, which is slower, not wrong.
+
+    Each side is cached `chunk_size` rows at a time, and each chunk is committed
+    before the next is read, so memory does not grow with the corpus (beyond the
+    block's index) and a job killed at its time limit resumes, when run again,
+    at the first chunk it had not committed. `progress` gets one line per chunk.
     Returns a compact summary that is useful for CLI output and tests.
     """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     # No-op for tasks already in the v2 `task.dataset[subset][split]` layout; the
     # NanoBEIR tasks still load in v1 (`task.corpus`, `task.queries`).
     task.convert_v1_dataset_format_to_v2(num_proc=None)
@@ -85,20 +100,30 @@ def precompute_task_cache(
                     (PromptType.document, data["corpus"]),
                     (PromptType.query, data["queries"]),
                 ):
-                    loader = create_dataloader(
-                        rows,
-                        task_metadata=task.metadata,
-                        prompt_type=prompt_type,
-                        batch_size=batch_size,
-                    )
-                    wrapper.encode(
-                        loader,
-                        task_metadata=task.metadata,
-                        hf_split=split,
-                        hf_subset=subset,
-                        prompt_type=prompt_type,
-                        batch_size=batch_size,
-                    )
+                    for begin in range(0, len(rows), chunk_size):
+                        end = min(begin + chunk_size, len(rows))
+                        # Sliced before MTEB prepares the text, as its own
+                        # `_full_corpus_search` does, so only one chunk is ever
+                        # materialised.
+                        loader = create_dataloader(
+                            rows.select(range(begin, end)),
+                            task_metadata=task.metadata,
+                            prompt_type=prompt_type,
+                            batch_size=batch_size,
+                        )
+                        misses = wrapper.fill(
+                            loader,
+                            task_metadata=task.metadata,
+                            hf_split=split,
+                            hf_subset=subset,
+                            prompt_type=prompt_type,
+                            batch_size=batch_size,
+                        )
+                        if progress is not None:
+                            progress(
+                                f"{task.metadata.name} {split}/{subset} {prompt_type.value}: "
+                                f"{end:,}/{len(rows):,} cached, {misses:,} of this chunk encoded"
+                            )
                     if prompt_type == PromptType.document:
                         documents += len(rows)
                     else:

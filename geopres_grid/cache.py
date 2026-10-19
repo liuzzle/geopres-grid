@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -81,12 +82,50 @@ def copy_document_blocks(
     return copied
 
 
+def committed_rows(directory: str | Path) -> int:
+    """Rows of a block that its index commits to: `ids.parquet`'s row count, 0 without one.
+
+    Read from the parquet footer, so it costs nothing for a multi-million-row block.
+    """
+    import pyarrow.parquet as pq
+
+    ids_file = Path(directory) / "ids.parquet"
+    return int(pq.read_metadata(ids_file).num_rows) if ids_file.exists() else 0
+
+
+def committed_embeddings(directory: str | Path) -> np.ndarray:
+    """A block's committed vectors, memory-mapped: `embeddings.npy` cut to `committed_rows`.
+
+    Rows past the index are an append that stopped before its index was written
+    (`GeoPresCache.add`); they belong to no key and the next write replaces them.
+    """
+    directory = Path(directory)
+    rows = committed_rows(directory)
+    vectors = np.load(directory / "embeddings.npy", mmap_mode="r")
+    if vectors.shape[0] < rows:
+        raise ValueError(
+            f"{directory}: embeddings.npy has {vectors.shape[0]} rows but ids.parquet "
+            f"{rows} -- two writers or a damaged block; delete the block and "
+            "precompute it again"
+        )
+    return vectors[:rows]
+
+
 class GeoPresCache:
     """Store fp32 embeddings and a positional parquet index.
 
     ``prompted_texts`` is explicit because the raw item text is not necessarily
     the text sent to the backbone. The MTEB cache protocol remains supported for
     bare-text callers; the project wrapper should use the prompted-text methods.
+
+    Writes are appends, so a corpus can be cached chunk by chunk with bounded
+    memory and a killed job keeps every chunk it saved. `add` appends the new
+    rows to `embeddings.npy` in place and then grows the array's header;
+    `save` then replaces `ids.parquet` atomically, and that is the commit: a
+    block is exactly the rows its index names. A job killed between the two
+    leaves rows past the index, which every reader ignores and the next `add`
+    overwrites. Fewer array rows than index rows cannot come from one writer
+    and is refused.
     """
 
     def __init__(
@@ -107,6 +146,7 @@ class GeoPresCache:
             columns=("row_idx", "item_id", "text_hash", "prompted_text")
         )
         self._vectors: np.ndarray | None = None
+        self._committed = 0
 
     @staticmethod
     def text_hash(prompted_text: str) -> str:
@@ -125,24 +165,17 @@ class GeoPresCache:
             return
         self._ids = pd.read_parquet(self.ids_file)
         self._ids["row_idx"] = self._ids["row_idx"].astype(int)
-        rows = int(np.load(self.embeddings_file, mmap_mode="r").shape[0])
-        if rows != len(self._ids):
-            # The array and the index are written separately. A crash between the
-            # two writes, or two writers on one block, leaves them from different
-            # runs, and every lookup would then be silently wrong.
-            raise ValueError(
-                f"{self.directory}: embeddings.npy has {rows} rows but ids.parquet "
-                f"{len(self._ids)} -- two writers or an interrupted write; delete "
-                "the block and precompute it again"
-            )
+        # Raises on fewer array rows than index rows; cuts off an uncommitted tail.
+        self._vectors = committed_embeddings(self.directory)
+        if len(self._vectors) != len(self._ids):
+            raise ValueError(f"{self.directory}: ids.parquet changed while loading -- two writers")
+        self._committed = len(self._ids)
         self._index = {
             str(text_hash): int(row_idx)
             for text_hash, row_idx in zip(self._ids["text_hash"], self._ids["row_idx"])
         }
         if self.dimension is None:
-            shape = np.load(self.embeddings_file, mmap_mode="r").shape
-            self.dimension = int(shape[1])
-        self._vectors = np.load(self.embeddings_file, mmap_mode="r+")
+            self.dimension = int(self._vectors.shape[1])
 
     def load(self) -> None:
         """Load the index and memory-map the embedding array."""
@@ -153,6 +186,14 @@ class GeoPresCache:
     @staticmethod
     def _hashes(prompted_texts: Iterable[str]) -> list[str]:
         return [GeoPresCache.text_hash(text) for text in prompted_texts]
+
+    def _rows(self, prompted_texts: Iterable[str]) -> np.ndarray:
+        return np.array([self._index.get(key, -1) for key in self._hashes(prompted_texts)], dtype=np.int64)
+
+    def missing(self, prompted_texts: Iterable[str]) -> np.ndarray:
+        """Boolean mask of the texts not cached. Reads the index only, no vectors."""
+        self._ensure_loaded()
+        return self._rows(prompted_texts) < 0
 
     def get_vectors(
         self,
@@ -167,7 +208,7 @@ class GeoPresCache:
         ]
         if len(texts) != len(items):
             raise ValueError("prompted_texts must have one entry per item")
-        rows = np.array([self._index.get(key, -1) for key in self._hashes(texts)], dtype=np.int64)
+        rows = self._rows(texts)
         missing = rows < 0
         if self._vectors is None:
             return None, missing
@@ -238,12 +279,79 @@ class GeoPresCache:
 
         if not new_rows:
             return
-        existing = self._vectors[: len(self._index)] if self._vectors is not None else None
-        combined = np.vstack([part for part in (existing, np.asarray(new_rows, dtype=np.float32)) if part is not None])
-        self._write_embeddings(combined)
-        self._ids = pd.concat([self._ids, pd.DataFrame(new_records)], ignore_index=True)
+        self._append_embeddings(np.asarray(new_rows, dtype=np.float32), start=len(self._index))
+        records = pd.DataFrame(new_records)
+        # Not concatenated onto the empty frame: its object columns would turn every
+        # string column into Python objects, about twice the memory of pandas' own
+        # string dtype -- per row of a multi-million-passage index.
+        self._ids = records if self._ids.empty else pd.concat([self._ids, records], ignore_index=True)
         self._index.update({record["text_hash"]: record["row_idx"] for record in new_records})
-        self._vectors = np.load(self.embeddings_file, mmap_mode="r+")
+        self._vectors = np.load(self.embeddings_file, mmap_mode="r")[: len(self._index)]
+
+    def _check_sole_writer(self) -> None:
+        on_disk = committed_rows(self.directory)
+        if on_disk != self._committed:
+            raise ValueError(
+                f"{self.directory}: ids.parquet has {on_disk} rows, this writer last "
+                f"committed {self._committed} -- another process is writing this block"
+            )
+
+    def _append_embeddings(self, values: np.ndarray, *, start: int) -> None:
+        """Write `values` as rows `start`, `start + 1`, ... of `embeddings.npy`, in place.
+
+        Only the new rows and the header are written, never the existing rows, so
+        caching a corpus in chunks costs linear, not quadratic, I/O. Anything past
+        `start` (an uncommitted tail) is overwritten and cut off. The rows go in
+        before the header names them, so a kill in between leaves the old header,
+        which is still a valid file. numpy leaves room in every header for axis 0
+        to grow to 21 digits; a header that would change length is refused rather
+        than shifted.
+        """
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._check_sole_writer()
+        if not self.embeddings_file.exists():
+            if start:
+                raise ValueError(f"{self.directory}: {start} rows indexed but no embeddings.npy")
+            self._write_embeddings(values)
+            return
+        from numpy.lib import format as npy
+
+        writers = {(1, 0): npy.write_array_header_1_0, (2, 0): npy.write_array_header_2_0}
+        readers = {(1, 0): npy.read_array_header_1_0, (2, 0): npy.read_array_header_2_0}
+        with open(self.embeddings_file, "r+b") as handle:
+            version = npy.read_magic(handle)
+            if version not in readers:
+                raise ValueError(f"{self.embeddings_file}: unsupported .npy version {version}")
+            shape, fortran_order, dtype = readers[version](handle)
+            offset = handle.tell()
+            if (
+                dtype != np.float32
+                or fortran_order
+                or len(shape) != 2
+                or shape[1] != values.shape[1]
+                or shape[0] < start
+            ):
+                raise ValueError(
+                    f"{self.embeddings_file}: cannot append {values.shape} at row {start} "
+                    f"to a {dtype} array of shape {shape}"
+                )
+            header = io.BytesIO()
+            writers[version](
+                header,
+                {
+                    "descr": npy.dtype_to_descr(np.dtype(np.float32)),
+                    "fortran_order": False,
+                    "shape": (start + len(values), int(shape[1])),
+                },
+            )
+            if len(header.getvalue()) != offset:
+                raise ValueError(f"{self.embeddings_file}: the grown header no longer fits")
+            handle.seek(offset + start * shape[1] * np.dtype(np.float32).itemsize)
+            handle.write(np.ascontiguousarray(values, dtype=np.float32).tobytes())
+            handle.truncate()
+            handle.flush()
+            handle.seek(0)
+            handle.write(header.getvalue())
 
     def _write_embeddings(self, values: np.ndarray) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -257,22 +365,28 @@ class GeoPresCache:
             temporary.unlink(missing_ok=True)
 
     def save(self) -> None:
-        """Persist embeddings, positional identifiers, and metadata."""
+        """Commit: write the index (atomically) and the metadata."""
         self._ensure_loaded()
         if self._vectors is None:
             return
-        self._vectors.flush()
+        self._check_sole_writer()
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._ids.to_parquet(self.ids_file, index=False)
+        fd, name = tempfile.mkstemp(dir=self.directory, suffix=".parquet")
+        os.close(fd)
+        temporary = Path(name)
+        try:
+            self._ids.to_parquet(temporary, index=False)
+            os.replace(temporary, self.ids_file)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self._committed = len(self._ids)
         self.meta_file.write_text(
             json.dumps(self.metadata, indent=2, sort_keys=True), encoding="utf-8"
         )
 
     def close(self) -> None:
-        """Flush and release the memory map."""
-        if self._vectors is not None:
-            self._vectors.flush()
-            self._vectors = None
+        """Release the memory map."""
+        self._vectors = None
 
     def __del__(self) -> None:
         self.close()
@@ -401,6 +515,67 @@ class CachedBackbone:
     def _items(inputs: Any) -> list[dict[str, Any]]:
         return [dict(item) for item in inputs.dataset]
 
+    def _prepare(
+        self, inputs: Any, task_metadata: Any, hf_split: str, hf_subset: str, prompt_type: Any
+    ) -> tuple[GeoPresCache, list[dict[str, Any]], list[str], str, list[str]]:
+        items = self._items(inputs)
+        raw_texts = [str(item.get("text", "")) for item in items]
+        prefix = self.backbone.prompt_for(
+            prompt_side(prompt_type), getattr(task_metadata, "type", None)
+        )
+        prompted_texts = [prefix + text for text in raw_texts]
+        cache = self._get_cache(
+            self._cache_path(task_metadata.name, hf_split, hf_subset, self._side(prompt_type))
+        )
+        return cache, items, raw_texts, prefix, prompted_texts
+
+    def _encode_misses(
+        self,
+        cache: GeoPresCache,
+        items: list[dict[str, Any]],
+        raw_texts: list[str],
+        prefix: str,
+        prompted_texts: list[str],
+        missing_indices: np.ndarray,
+        *,
+        batch_size: int,
+        show_progress_bar: bool,
+    ) -> np.ndarray:
+        """Encode, store and commit the missing inputs; return their vectors in order."""
+        if self._model is None:
+            raise RuntimeError(
+                f"{len(missing_indices)} of {len(items)} inputs are not cached in "
+                f"{cache.directory} and no model is loaded. Precompute this task "
+                "(scripts/precompute.py) or evaluate with --load-model."
+            )
+        # One encode per distinct prompted text. Corpora repeat documents
+        # (NanoArguAna does), and two copies in differently padded batches come
+        # back differing in the last bits -- which `GeoPresCache.add` rightly
+        # refuses to store under one key.
+        first: dict[str, int] = {}
+        for index in missing_indices:
+            first.setdefault(prompted_texts[index], int(index))
+        unique = list(first.values())
+        encoded = self._model.encode(
+            [raw_texts[index] for index in unique],
+            prompt=prefix,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=show_progress_bar,
+        )
+        if hasattr(encoded, "detach"):
+            encoded = encoded.detach().cpu().numpy()
+        encoded = np.asarray(encoded, dtype=np.float32)
+        cache.add(
+            [items[index] for index in unique],
+            encoded,
+            prompted_texts=[prompted_texts[index] for index in unique],
+        )
+        cache.save()
+        self.newly_encoded += len(unique)
+        row_of = {prompted_texts[index]: row for row, index in enumerate(unique)}
+        return encoded[[row_of[prompted_texts[index]] for index in missing_indices]]
+
     def encode(
         self,
         inputs: Any,
@@ -413,53 +588,23 @@ class CachedBackbone:
         **kwargs: Any,
     ) -> np.ndarray:
         """Return cached vectors, encoding only prompted-text misses."""
-        side = self._side(prompt_type)
-        items = self._items(inputs)
-        raw_texts = [str(item.get("text", "")) for item in items]
-        prefix = self.backbone.prompt_for(
-            prompt_side(prompt_type), getattr(task_metadata, "type", None)
-        )
-        prompted_texts = [prefix + text for text in raw_texts]
-        cache = self._get_cache(
-            self._cache_path(task_metadata.name, hf_split, hf_subset, side)
+        cache, items, raw_texts, prefix, prompted_texts = self._prepare(
+            inputs, task_metadata, hf_split, hf_subset, prompt_type
         )
         cached, missing = cache.get_vectors(items, prompted_texts=prompted_texts)
         missing_indices = np.flatnonzero(missing)
         newly_encoded = np.empty((len(missing_indices), cache.dimension or self.backbone.native_dim), dtype=np.float32)
-        if len(missing_indices) and self._model is None:
-            raise RuntimeError(
-                f"{len(missing_indices)} of {len(items)} inputs are not cached in "
-                f"{cache.directory} and no model is loaded. Precompute this task "
-                "(scripts/precompute.py) or evaluate with --load-model."
-            )
         if len(missing_indices):
-            # One encode per distinct prompted text. Corpora repeat documents
-            # (NanoArguAna does), and two copies in differently padded batches come
-            # back differing in the last bits -- which `GeoPresCache.add` rightly
-            # refuses to store under one key.
-            first: dict[str, int] = {}
-            for index in missing_indices:
-                first.setdefault(prompted_texts[index], int(index))
-            unique = list(first.values())
-            encoded = self._model.encode(
-                [raw_texts[index] for index in unique],
-                prompt=prefix,
+            newly_encoded = self._encode_misses(
+                cache,
+                items,
+                raw_texts,
+                prefix,
+                prompted_texts,
+                missing_indices,
                 batch_size=batch_size,
-                convert_to_numpy=True,
                 show_progress_bar=bool(kwargs.get("show_progress_bar", False)),
             )
-            if hasattr(encoded, "detach"):
-                encoded = encoded.detach().cpu().numpy()
-            encoded = np.asarray(encoded, dtype=np.float32)
-            cache.add(
-                [items[index] for index in unique],
-                encoded,
-                prompted_texts=[prompted_texts[index] for index in unique],
-            )
-            cache.save()
-            self.newly_encoded += len(unique)
-            row_of = {prompted_texts[index]: row for row, index in enumerate(unique)}
-            newly_encoded = encoded[[row_of[prompted_texts[index]] for index in missing_indices]]
 
         if cached is None:
             result = np.empty((len(items), newly_encoded.shape[1]), dtype=np.float32)
@@ -468,6 +613,39 @@ class CachedBackbone:
         if len(missing_indices):
             result[missing_indices] = newly_encoded
         return result
+
+    def fill(
+        self,
+        inputs: Any,
+        *,
+        task_metadata: Any,
+        hf_split: str,
+        hf_subset: str,
+        prompt_type: Any,
+        batch_size: int = 32,
+    ) -> int:
+        """Cache `inputs` like `encode`, without reading or returning any vector.
+
+        Precompute's path: a resumed job finds most chunks fully cached, and
+        `encode` would read every one of their vectors back from disk for nothing.
+        Returns the number of inputs that were misses.
+        """
+        cache, items, raw_texts, prefix, prompted_texts = self._prepare(
+            inputs, task_metadata, hf_split, hf_subset, prompt_type
+        )
+        missing_indices = np.flatnonzero(cache.missing(prompted_texts))
+        if len(missing_indices):
+            self._encode_misses(
+                cache,
+                items,
+                raw_texts,
+                prefix,
+                prompted_texts,
+                missing_indices,
+                batch_size=batch_size,
+                show_progress_bar=False,
+            )
+        return len(missing_indices)
 
     def close(self) -> None:
         for cache in getattr(self, "_caches", {}).values():

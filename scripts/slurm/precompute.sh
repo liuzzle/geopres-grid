@@ -4,6 +4,12 @@
 #   sbatch scripts/slurm/precompute.sh <backbone> [tier]      # tier defaults to tier1
 #
 # Submit from the repo root; `.env` there sets PROJECT_ROOT and STORAGE_PATH.
+#
+# 4 h is sized for tier 1. Precompute commits every --chunk-size passages, so a
+# job that hits its limit loses at most one chunk: submit the same command again
+# and it resumes. For tier 2 ask for more time on the command line, e.g.
+#   sbatch --time=1-00:00:00 scripts/slurm/precompute.sh mgte tier2
+# One job per backbone and tier: two jobs on one backbone write the same blocks.
 # The harriers run in the root environment only: precomputed in both transformers
 # environments they get two encode hashes, and evaluation then needs --encode-hash.
 #
