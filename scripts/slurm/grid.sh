@@ -5,6 +5,7 @@
 #   sbatch scripts/slurm/grid.sh --backbone mgte --tier tier1 --baselines-only
 #
 # Root environment for every backbone: evaluation reads the cache, no model.
+# --mem is tier 1's; submit_grid.sh asks for 64G on tier 2 (logging.md §30).
 #SBATCH --job-name=grid
 #SBATCH --time=0-08:00:00
 #SBATCH --mem=16G
