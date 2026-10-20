@@ -87,6 +87,7 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   correctness test is a required deliverable of work package C.
 - Do not perform any commits, I will check the code first, only tell me what groups should be committed and a appropriate short and simple commit message draft.
 - Log everything you do + reasoning in `logging.md`
+- Save runtimes in logging.md too
 
 ## Things that will bite
 
