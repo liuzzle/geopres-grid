@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from geopres_grid.cache import GeoPresCache
+from geopres_grid.cache import as_text_inputs
 from geopres_grid.cache import CachedBackbone
 from geopres_grid.cache import encode_configs_on_disk
 from geopres_grid.cache import resolve_encode_config
@@ -631,3 +632,47 @@ def test_a_second_writer_on_one_block_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="another process"):
         second.add(items("c"), rows(2, 1))
+
+
+class FakeMultimodalModel(FakeModel):
+    """Declares the modalities EmbeddingGemma-2 does under sentence-transformers 6."""
+
+    modalities = ["text", "image", "audio", "video", "message"]
+
+    def encode(self, inputs, **kwargs):
+        self.inputs = list(inputs)
+        return super().encode([x["text"] if isinstance(x, dict) else x for x in inputs], **kwargs)
+
+
+def test_a_media_url_passage_is_encoded_as_text_on_a_multimodal_model(tmp_path):
+    model = FakeMultimodalModel()
+    wrapper = CachedBackbone(model, get("mdenseon"), make_encode_config(), tmp_path)
+    rows = [
+        {"id": "d1", "text": "https://example.com/photo.jpg"},
+        {"id": "d2", "text": "https://www.youtube.com/watch?v=abc"},
+        {"id": "d3", "text": "plain text with https://example.com/photo.jpg in it"},
+    ]
+    first = wrapper.encode(
+        FakeInputs(rows), task_metadata=FakeMetadata(), hf_split="test", hf_subset="default",
+        prompt_type="document",
+    )
+
+    # Only the strings sentence-transformers 6 would fetch as media are wrapped.
+    assert model.inputs == [{"text": rows[0]["text"]}, {"text": rows[1]["text"]}, rows[2]["text"]]
+    # The cache key is still the prompted text: a warm read finds every row.
+    again = wrapper.encode(
+        FakeInputs(rows), task_metadata=FakeMetadata(), hf_split="test", hf_subset="default",
+        prompt_type="document",
+    )
+    assert model.calls == 1
+    np.testing.assert_array_equal(again, first)
+
+
+def test_text_only_models_get_plain_strings():
+    texts = ["https://example.com/photo.jpg", "plain"]
+
+    class TextOnly:
+        modalities = ["text", "message"]
+
+    assert as_text_inputs(object(), texts) == texts  # sentence-transformers 5.x: no attribute
+    assert as_text_inputs(TextOnly(), texts) == texts

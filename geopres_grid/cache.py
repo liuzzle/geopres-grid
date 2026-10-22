@@ -392,6 +392,32 @@ class GeoPresCache:
         self.close()
 
 
+def as_text_inputs(model: Any, texts: list[str]) -> list[str | dict[str, str]]:
+    """`texts` for `model.encode`, each guaranteed to be read as text.
+
+    sentence-transformers 6 guesses every string's modality before encoding
+    (`sentence_transformers.base.modality.infer_modality`). For a model that
+    accepts images, video or audio -- EmbeddingGemma-2 -- a passage that is a bare
+    `http(s)://...jpg` URL (no space; MSMARCO has such passages) is downloaded and
+    embedded as an image, a YouTube link as a video. On a compute node the download
+    fails and kills the job; where it succeeds, a text passage is cached with an
+    image's vector. Only the strings sentence-transformers would misread are wrapped
+    as `{"text": ...}`, which it unwraps to the same string on the same text path
+    (same rendering, same length sort), so every other input is passed exactly as
+    before and already-cached vectors stay consistent. sentence-transformers 5.x has
+    the same guess but only ever with text-only models here, so nothing is wrapped.
+    """
+    modalities = getattr(model, "modalities", None)
+    if not modalities or all(modality == "text" for modality in modalities):
+        return list(texts)
+    from sentence_transformers.base.modality import infer_modality
+
+    return [
+        text if infer_modality(text, supported_modalities=modalities) == "text" else {"text": text}
+        for text in texts
+    ]
+
+
 def side_of(prompt_type: Any) -> str:
     """Cache side for an MTEB `prompt_type`; tasks without one (STS,
     classification, clustering) are queries."""
@@ -557,7 +583,7 @@ class CachedBackbone:
             first.setdefault(prompted_texts[index], int(index))
         unique = list(first.values())
         encoded = self._model.encode(
-            [raw_texts[index] for index in unique],
+            as_text_inputs(self._model, [raw_texts[index] for index in unique]),
             prompt=prefix,
             batch_size=batch_size,
             convert_to_numpy=True,
