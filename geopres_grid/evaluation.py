@@ -120,6 +120,56 @@ def task_names(tier: Tier) -> tuple[str, ...]:
     return TIER_TASKS[tier]
 
 
+def cached_dataset_configs(path: str, revision: str | None) -> list[str]:
+    """Configs of a Hub dataset found in the local `datasets` cache at exactly `revision`.
+
+    The cache keeps each prepared config under
+    `{HF_DATASETS_CACHE}/{namespace}___{snake_case name}/{config}/{version}/{revision}`.
+    Empty if nothing of that revision is cached.
+    """
+    import datasets
+    from datasets.naming import camelcase_to_snakecase
+
+    if not revision:
+        return []
+    parts = path.split("/")
+    parts[-1] = camelcase_to_snakecase(parts[-1])
+    root = Path(datasets.config.HF_DATASETS_CACHE).expanduser() / "___".join(parts)
+    return sorted({entry.parts[-3] for entry in root.glob(f"*/*/{revision}") if entry.is_dir()})
+
+
+def use_cached_dataset_configs() -> None:
+    """Let MTEB's retrieval loader find its configs offline (`HF_DATASETS_OFFLINE`).
+
+    `RetrievalDatasetLoader` (mteb 2.15.1) starts by asking
+    `datasets.get_dataset_config_names` which configs a task's repo has. Offline,
+    that cannot list the repo and answers `["default"]`; MTEB then asks for qrels
+    under `default`, while BEIR repos cache them as `qrels` (next to `corpus`,
+    `queries`), and loading fails ("Couldn't find cache ... for config 'default'").
+    Offline, this answers from the cache instead, at the task's pinned revision only.
+    Online, and when nothing of that revision is cached, the original runs. Grid jobs
+    run offline because dozens of shards asking the Hub API got the cluster's IP
+    rate-limited (logging.md §33.8). Idempotent.
+    """
+    from mteb.abstasks import retrieval_dataset_loaders as loaders
+
+    original = loaders.get_dataset_config_names
+    if getattr(original, "geopres_cached", False):
+        return
+
+    def config_names(path: str, revision: str | None = None, *args: Any, **kwargs: Any) -> list[str]:
+        import datasets
+
+        if datasets.config.HF_DATASETS_OFFLINE:
+            found = cached_dataset_configs(path, revision)
+            if found:
+                return found
+        return original(path, revision, *args, **kwargs)
+
+    config_names.geopres_cached = True  # type: ignore[attr-defined]
+    loaders.get_dataset_config_names = config_names
+
+
 def load_tasks(names: Any) -> list[Any]:
     """MTEB task objects for `names`, with `TASK_EVAL_SPLITS` applied.
 
@@ -128,6 +178,7 @@ def load_tasks(names: Any) -> list[Any]:
     """
     import mteb
 
+    use_cached_dataset_configs()
     return [
         mteb.get_task(name, eval_splits=list(TASK_EVAL_SPLITS[name]) if name in TASK_EVAL_SPLITS else None)
         for name in names

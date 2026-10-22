@@ -17,6 +17,8 @@ from geopres_grid.evaluation import baseline_pass
 from geopres_grid.evaluation import load_tasks
 from geopres_grid.evaluation import PostProcessedBackbone
 from geopres_grid.evaluation import cached_blocks
+from geopres_grid.evaluation import cached_dataset_configs
+from geopres_grid.evaluation import use_cached_dataset_configs
 from geopres_grid.evaluation import evaluate_cell
 from geopres_grid.evaluation import sample_rows
 from geopres_grid.evaluation import task_names
@@ -288,3 +290,45 @@ def test_the_precompute_baseline_pass_cannot_be_skipped(tmp_path, monkeypatch):
 def test_a_reducing_or_quantizing_cell_is_not_identity():
     assert not PostProcConfig(quant_method="int8").is_identity
     assert not PostProcConfig(dr_method="truncate", target_dim=4).is_identity
+
+
+def fake_datasets_cache(root, repo_dir, configs, revision):
+    for config in configs:
+        (root / repo_dir / config / "0.0.0" / revision).mkdir(parents=True)
+
+
+def test_cached_dataset_configs_reads_the_pinned_revision_only(tmp_path, monkeypatch):
+    import datasets
+
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path)
+    fake_datasets_cache(tmp_path, "mteb___cqa_dupstack_android_retrieval", ["corpus", "qrels", "queries"], "a" * 40)
+    fake_datasets_cache(tmp_path, "mteb___cqa_dupstack_android_retrieval", ["default"], "b" * 40)
+
+    assert cached_dataset_configs("mteb/CQADupstackAndroidRetrieval", "a" * 40) == ["corpus", "qrels", "queries"]
+    assert cached_dataset_configs("mteb/CQADupstackAndroidRetrieval", "c" * 40) == []
+    assert cached_dataset_configs("mteb/CQADupstackAndroidRetrieval", None) == []
+
+
+def test_mteb_gets_cached_configs_offline_and_the_hub_online(tmp_path, monkeypatch):
+    import datasets
+    from mteb.abstasks import retrieval_dataset_loaders as loaders
+
+    calls = []
+
+    def hub(path, revision=None, *args, **kwargs):
+        calls.append(path)
+        return ["default"]  # what datasets answers offline for a repo it cannot list
+
+    monkeypatch.setattr(loaders, "get_dataset_config_names", hub)
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path)
+    fake_datasets_cache(tmp_path, "mteb___cqa_dupstack_android_retrieval", ["corpus", "qrels", "queries"], "a" * 40)
+    use_cached_dataset_configs()
+    use_cached_dataset_configs()  # idempotent: wraps once
+
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_OFFLINE", True)
+    assert loaders.get_dataset_config_names("mteb/CQADupstackAndroidRetrieval", "a" * 40) == ["corpus", "qrels", "queries"]
+    assert calls == []
+    assert loaders.get_dataset_config_names("mteb/scifact", "d" * 40) == ["default"]  # nothing cached
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_OFFLINE", False)
+    assert loaders.get_dataset_config_names("mteb/CQADupstackAndroidRetrieval", "a" * 40) == ["default"]
+    assert calls == ["mteb/scifact", "mteb/CQADupstackAndroidRetrieval"]
