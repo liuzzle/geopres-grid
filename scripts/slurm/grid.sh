@@ -17,6 +17,11 @@ set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME=${HF_HOME:-/scratch/$USER/hf}
+# Datasets come from HF_HOME's cache, where precompute put them. Online, every shard
+# asks the Hub API about every dataset; dozens of shards from the cluster's one IP got
+# rate-limited (429) and failed (logging.md §33.8). HF_HUB_OFFLINE=0 to go online.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-$HF_HUB_OFFLINE}
 # numpy (OpenBLAS) and torch otherwise start one thread per core of the node, not
 # of the job; on the login node that alone exhausts the per-user memory limit.
 threads=${SLURM_CPUS_PER_TASK:-4}
