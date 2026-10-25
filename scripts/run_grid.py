@@ -30,7 +30,7 @@ from geopres_grid.cache import CachedBackbone, resolve_encode_config
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH
 from geopres_grid.evaluation import TIER_TASKS, PostProcessedBackbone, baseline_pass, evaluate_cell, load_tasks, task_names
 from geopres_grid.grid import GRID_DR_METHODS, GRID_QUANT_METHODS, GRID_TARGET_DIMS, grid_cells, shard
-from geopres_grid.identity import BITS_PER_DIM, DR_METHODS, PCA_MEAN_MODES
+from geopres_grid.identity import BITS_PER_DIM, DEFAULT_DR_SEED, DR_METHODS, PCA_MEAN_MODES, SEEDED_DR_METHODS
 from geopres_grid.precompute import leaf_tasks
 
 
@@ -48,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--pca-mean",
         choices=PCA_MEAN_MODES,
         help="pca/pca_ror cells: restore the projected mean before cosine (default) or keep it subtracted (tier 1)",
+    )
+    parser.add_argument(
+        "--dr-seed",
+        action="append",
+        type=int,
+        help=f"Seed for {', '.join(SEEDED_DR_METHODS)}: one cell per seed, other methods once; "
+        f"repeatable; default {DEFAULT_DR_SEED}, the run ids every grid so far was scored under",
     )
     parser.add_argument("--shard", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
     parser.add_argument("--num-shards", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1)))
@@ -68,13 +75,15 @@ def main(argv: list[str] | None = None) -> int:
             target_dims=args.target_dim or GRID_TARGET_DIMS,
             quant_methods=args.quant_method or GRID_QUANT_METHODS,
             pca_mean=args.pca_mean,
+            dr_seeds=args.dr_seed or (None,),
         ),
         args.shard,
         args.num_shards,
     )
     if args.list:
         for config in cells:
-            print(config.dr_method, config.target_dim, config.quant_method)
+            seed = [f"seed={config.resolved_dr_seed}"] if config.dr_method in SEEDED_DR_METHODS else []
+            print(config.dr_method, config.target_dim, config.quant_method, *seed)
         print(f"{len(cells)} cells in shard {args.shard}/{args.num_shards} for {backbone.key}")
         return 0
 
@@ -104,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             for config in cells:
                 label = f"{name} {config.dr_method}-{config.target_dim} {config.quant_method}"
+                if config.dr_method in SEEDED_DR_METHODS:
+                    label += f" seed {config.resolved_dr_seed}"
                 started = time.monotonic()
                 try:
                     baseline, scored = evaluate_cell(
