@@ -7,6 +7,10 @@ registry order, and a DR method likewise. Palette from the dataviz reference
 instance, validated for colour-vision deficiency on adjacent pairs; three of the
 hues are below 3:1 on white, so every series also carries its own marker and a
 legend, and the numbers are in the CSVs next to the figures.
+
+A relative view (retention, delta, gain) shows the absolute score next to it, as a
+second row of panels or in the labels; the per-backbone figures (`*_by_backbone`)
+facet what the others average over backbones.
 """
 
 from __future__ import annotations
@@ -31,6 +35,9 @@ DIVERGING = ("#b8322f", "#e34948", "#f0efec", "#2a78d6", "#1c5cab")
 DR_SERIES = ("truncate", "pca", "random_projection", "random_selection", "pca_ror")
 """DR methods in colour order. `pca_ror` last: it is identical to `pca` at fp32
 and only drawn where quantization separates them."""
+
+BASELINE_STYLE = {"color": INK, "marker": "*", "markersize": 9, "linestyle": "none"}
+"""The no-reduction fp32 point wherever a curve ends at full precision."""
 
 QUANT_LABELS = {
     "none": "fp32",
@@ -114,97 +121,141 @@ def _dim_axis(axis, dims) -> None:
     axis.minorticks_off()
 
 
-def quantization_only(table: pd.DataFrame):
-    """Dot plot: retention per quantizer at full dimension, one marker per backbone."""
+def quantization_only(table: pd.DataFrame, scores: pd.DataFrame | None = None):
+    """Dot plot: retention per quantizer at full dimension, one marker per backbone.
+
+    With `scores` (`analysis.quantization_only(cells, "score")`) a second panel
+    shows the absolute mean nDCG@10, fp32 first.
+    """
     plt = _pyplot()
-    quantizers = [q for q in QUANT_ORDER if q in table.columns and q != "none"]
     styles = series_style(list(table.index))
-    figure, axis = plt.subplots(figsize=(7.0, 3.4))
+    panels = [(table, "Retention (score / fp32 baseline)", True)]
+    if scores is not None:
+        panels.append((scores, "Mean nDCG@10", False))
+    quantizers = [q for q in QUANT_ORDER if q in table.columns and (q != "none" or scores is not None)]
+    figure, axes = plt.subplots(len(panels), 1, figsize=(7.0, 3.0 * len(panels) + 0.4), sharex=True, squeeze=False)
     offsets = np.linspace(-0.24, 0.24, len(table.index))
     x = np.arange(len(quantizers))
-    for offset, backbone in zip(offsets, table.index):
-        axis.scatter(
-            x + offset,
-            table.loc[backbone, quantizers].to_numpy(),
-            s=30,
-            label=backbone,
-            edgecolors="white",
-            linewidths=0.8,
-            zorder=3,
-            **styles[backbone],
-        )
-    axis.axhline(1.0, color=MUTED, linewidth=1, zorder=2)
-    axis.set_xticks(x)
-    axis.set_xticklabels([QUANT_LABELS[q] for q in quantizers])
-    axis.set_ylabel("Retention (score / fp32 baseline)")
-    axis.grid(axis="x", visible=False)
-    axis.legend(
+    for axis, (values, ylabel, reference) in zip(axes[:, 0], panels):
+        for offset, backbone in zip(offsets, table.index):
+            axis.scatter(
+                x + offset,
+                values.loc[backbone, quantizers].to_numpy(),
+                s=30,
+                label=backbone,
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=3,
+                **styles[backbone],
+            )
+        if reference:
+            axis.axhline(1.0, color=MUTED, linewidth=1, zorder=2)
+        axis.set_ylabel(ylabel)
+        axis.grid(axis="x", visible=False)
+    axes[-1, 0].set_xticks(x)
+    axes[-1, 0].set_xticklabels([QUANT_LABELS[q] for q in quantizers])
+    axes[0, 0].legend(
         ncol=len(table.index), loc="lower left", bbox_to_anchor=(0.0, 1.0), fontsize=8, handletextpad=0.2, columnspacing=1.0
     )
-    axis.set_title("Quantization alone, full dimension", loc="left", pad=22)
+    axes[0, 0].set_title("Quantization alone, full dimension", loc="left", pad=22)
+    figure.tight_layout()
     return figure
 
 
-def reduction_only(table: pd.DataFrame):
+def reduction_only(table: pd.DataFrame, scores: pd.DataFrame | None = None):
     """Small multiples: fp32 retention by dimension, one panel per backbone, a line per DR method.
 
-    `pca_ror` is omitted: at fp32 it equals `pca` exactly (rotation preserves cosine).
+    Each line ends, dotted, at the backbone's native dimension: the fp32 baseline
+    with no reduction (the star), the last column `analysis.reduction_only` fills
+    for that backbone. With `scores` a second row shows mean nDCG@10. `pca_ror` is
+    omitted: at fp32 it equals `pca` exactly (rotation preserves cosine).
     """
     plt = _pyplot()
     backbones = [b for b in backbone_order(table.reset_index()) if b in table.index.get_level_values(0)]
     methods = [m for m in DR_SERIES if m != "pca_ror" and m in table.index.get_level_values(1)]
     styles = series_style(list(DR_SERIES))
-    dims = list(table.columns)
-    figure, axes = plt.subplots(1, len(backbones), figsize=(2.2 * len(backbones), 2.9), sharey=True)
-    axes = np.atleast_1d(axes)
-    for axis, backbone in zip(axes, backbones):
-        for method in methods:
-            if (backbone, method) not in table.index:
-                continue
-            axis.plot(
-                dims,
-                table.loc[(backbone, method)].to_numpy(),
-                linewidth=2,
-                markersize=4.5,
-                label=method,
-                **styles[method],
-            )
-        axis.axhline(1.0, color=MUTED, linewidth=1)
-        _dim_axis(axis, dims)
-        axis.set_title(backbone, loc="left")
-        axis.set_xlabel("Target dimension")
-    axes[0].set_ylabel("Retention, fp32")
-    handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(handles, labels, ncol=len(methods), loc="upper left", bbox_to_anchor=(0.0, 1.08), fontsize=8)
+    panels = [(table, "Retention, fp32")] + ([(scores, "Mean nDCG@10, fp32")] if scores is not None else [])
+    figure, axes = plt.subplots(
+        len(panels), len(backbones), figsize=(2.3 * len(backbones), 2.7 * len(panels) + 0.3), sharey="row", squeeze=False
+    )
+    for row, (values, ylabel) in enumerate(panels):
+        for axis, backbone in zip(axes[row], backbones):
+            filled = values.loc[backbone].dropna(axis=1, how="all")
+            native = max(filled.columns)
+            dims = [d for d in filled.columns if d != native]
+            for method in methods:
+                if method not in filled.index:
+                    continue
+                line = filled.loc[method]
+                axis.plot(dims, line[dims].to_numpy(), linewidth=2, markersize=4.5, label=method, **styles[method])
+                axis.plot(
+                    [dims[-1], native], line[[dims[-1], native]].to_numpy(), linewidth=1.2, linestyle=":",
+                    color=styles[method]["color"],
+                )
+            axis.plot([native], [filled[native].iloc[0]], zorder=4, label="fp32, no reduction", **BASELINE_STYLE)
+            if row == 0:
+                axis.axhline(1.0, color=MUTED, linewidth=1)
+                axis.set_title(backbone, loc="left")
+            _dim_axis(axis, dims + [native])
+            # The native tick a line lower: 640 sits too close to 512 on a log axis.
+            axis.set_xticklabels([str(int(d)) for d in dims] + [f"\n{native}"])
+            axis.tick_params(axis="x", labelsize=7.5)
+            if row == len(panels) - 1:
+                axis.set_xlabel("Target dimension")
+        axes[row, 0].set_ylabel(ylabel)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, ncol=len(labels), loc="upper left", bbox_to_anchor=(0.0, 1.05), fontsize=8)
     figure.tight_layout()
     return figure
 
 
-def budget_frontier(cells: pd.DataFrame, frontier: pd.DataFrame):
-    """Best mean score at each storage size: every cell faint, each backbone's front as a line."""
-    plt = _pyplot()
-    backbones = backbone_order(cells)
-    styles = series_style(backbones)
-    figure, axis = plt.subplots(figsize=(7.0, 4.0))
-    axis.scatter(cells["bytes_per_vector"], cells["score"], s=6, color="#c3c2b7", alpha=0.5, linewidths=0, zorder=1)
-    for backbone in backbones:
-        front = frontier[frontier["backbone"] == backbone].sort_values("bytes_per_vector")
-        axis.plot(
-            front["bytes_per_vector"],
-            front["score"],
-            linewidth=2,
-            markersize=4.5,
-            drawstyle="steps-post",
-            label=backbone,
-            zorder=3,
-            **styles[backbone],
-        )
-    sizes = sorted(cells["bytes_per_vector"].unique())
-    ticks = [s for s in (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096) if sizes[0] <= s <= sizes[-1]]
+def _bytes_axis(axis, sizes) -> None:
+    ticks = [s for s in (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096) if min(sizes) <= s <= max(sizes)]
     axis.set_xscale("log", base=2)
     axis.set_xticks(ticks)
     axis.set_xticklabels([str(t) for t in ticks])
     axis.minorticks_off()
+
+
+def _baseline_cells(cells: pd.DataFrame) -> pd.DataFrame:
+    return cells[(cells["dr_method"] == "none") & (cells["quant_method"] == "none")].set_index("backbone")
+
+
+def _front_line(axis, front: pd.DataFrame, style: dict[str, Any], label: str | None) -> None:
+    front = front.sort_values("bytes_per_vector")
+    axis.plot(
+        front["bytes_per_vector"], front["score"], linewidth=2, markersize=4.5, drawstyle="steps-post",
+        label=label, zorder=3, **style,
+    )
+
+
+def _baseline_point(axis, baseline: pd.Series, style: dict[str, Any], label: str | None = None) -> None:
+    """fp32 reference: a large hollow marker in the backbone's colour, at its bytes per vector."""
+    axis.plot(
+        [baseline["bytes_per_vector"]], [baseline["score"]], marker=style["marker"], markersize=11,
+        markerfacecolor="none", markeredgecolor=style["color"], markeredgewidth=1.6, linestyle="none",
+        zorder=4, label=label,
+    )
+
+
+def budget_frontier(cells: pd.DataFrame, frontier: pd.DataFrame):
+    """Best mean score at each storage size: every cell faint, each backbone's front as a line.
+
+    Each backbone's uncompressed fp32 baseline is the large hollow marker at its own
+    bytes per vector (4 x native dimension), whether or not it is on the front.
+    """
+    plt = _pyplot()
+    backbones = backbone_order(cells)
+    styles = series_style(backbones)
+    baselines = _baseline_cells(cells)
+    figure, axis = plt.subplots(figsize=(7.0, 4.0))
+    axis.scatter(cells["bytes_per_vector"], cells["score"], s=6, color="#c3c2b7", alpha=0.5, linewidths=0, zorder=1)
+    for backbone in backbones:
+        _front_line(axis, frontier[frontier["backbone"] == backbone], styles[backbone], backbone)
+        _baseline_point(axis, baselines.loc[backbone], styles[backbone])
+    axis.plot([], [], marker="o", markersize=9, markerfacecolor="none", markeredgecolor=INK_SECONDARY,
+              linestyle="none", label="fp32 baseline (hollow)")
+    _bytes_axis(axis, cells["bytes_per_vector"])
     axis.set_xlabel("Bytes per vector")
     axis.set_ylabel("Mean nDCG@10")
     axis.set_title("Best configuration per storage budget (gray: every cell)", loc="left")
@@ -212,16 +263,49 @@ def budget_frontier(cells: pd.DataFrame, frontier: pd.DataFrame):
     return figure
 
 
-def _heatmap(table: pd.DataFrame, *, title: str, xlabel: str, ylabel: str, unit: str = "pts", limit: float | None = None):
+def budget_frontier_by_backbone(cells: pd.DataFrame, frontier: pd.DataFrame):
+    """One panel per backbone: its cells, its front with each front cell named, its fp32 baseline."""
     plt = _pyplot()
+    backbones = backbone_order(cells)
+    styles = series_style(backbones)
+    baselines = _baseline_cells(cells)
+    ncols = min(3, len(backbones))
+    nrows = int(np.ceil(len(backbones) / ncols))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 3.6 * nrows), sharey=True, squeeze=False)
+    for axis, backbone in zip(axes.flat, backbones):
+        own = cells[cells["backbone"] == backbone]
+        front = frontier[frontier["backbone"] == backbone].sort_values("bytes_per_vector")
+        axis.scatter(own["bytes_per_vector"], own["score"], s=7, color="#c3c2b7", alpha=0.7, linewidths=0, zorder=1)
+        _front_line(axis, front, styles[backbone], None)
+        _baseline_point(axis, baselines.loc[backbone], styles[backbone])
+        for _, cell in front.iterrows():
+            axis.annotate(
+                cell["label"].replace("random_", "r").replace("equal_count_", "EC-"), (cell["bytes_per_vector"], cell["score"]),
+                xytext=(2, -4), textcoords="offset points", fontsize=5.5, color=INK_SECONDARY, rotation=-60,
+                ha="left", va="top", zorder=5,
+            )
+        _bytes_axis(axis, cells["bytes_per_vector"])
+        axis.set_title(f"{backbone}  (fp32 {baselines.loc[backbone, 'score']:.3f})", loc="left")
+        axis.set_xlabel("Bytes per vector")
+    for axis in axes.flat[len(backbones):]:
+        axis.set_visible(False)
+    for axis in axes[:, 0]:
+        axis.set_ylabel("Mean nDCG@10")
+    figure.tight_layout()
+    return figure
+
+
+def _heatmap_on(axis, table: pd.DataFrame, limit: float):
+    """Draw `table` as an annotated diverging heatmap on `axis`; returns the image."""
     values = table.to_numpy(dtype=float)
-    limit = limit or max(float(np.nanmax(np.abs(values))), 1e-9)
-    height = 0.75 + 0.32 * len(table.index)
-    figure, axis = plt.subplots(figsize=(1.2 + 0.85 * len(table.columns), height))
     image = axis.imshow(values, cmap=_diverging_cmap(), vmin=-limit, vmax=limit, aspect="auto")
     axis.grid(False)
     axis.set_xticks(range(len(table.columns)))
-    axis.set_xticklabels([str(c) for c in table.columns])
+    labels = [str(c) for c in table.columns]
+    if max(map(len, labels)) > 8:  # configuration names: slanted, or neighbours overlap
+        axis.set_xticklabels(labels, rotation=35, ha="right", rotation_mode="anchor")
+    else:
+        axis.set_xticklabels(labels)
     axis.set_yticks(range(len(table.index)))
     axis.set_yticklabels([str(i) for i in table.index])
     axis.tick_params(length=0)
@@ -232,36 +316,109 @@ def _heatmap(table: pd.DataFrame, *, title: str, xlabel: str, ylabel: str, unit:
             continue
         strong = abs(value) > 0.55 * limit
         axis.text(column, row, f"{value:+.1f}", ha="center", va="center", fontsize=8, color="white" if strong else INK)
-    colorbar = figure.colorbar(image, ax=axis, fraction=0.04, pad=0.02)
+    return image
+
+
+def _colorbar(figure, image, axes, unit: str) -> None:
+    colorbar = figure.colorbar(image, ax=axes, fraction=0.04, pad=0.02)
     colorbar.outline.set_visible(False)
     colorbar.ax.tick_params(colors=MUTED, labelcolor=INK_SECONDARY, labelsize=8)
     colorbar.set_label(unit, color=INK_SECONDARY)
+
+
+def _limit(tables: list[pd.DataFrame]) -> float:
+    return max([float(np.nanmax(np.abs(t.to_numpy(dtype=float)))) for t in tables if t.size] + [1e-9])
+
+
+def _heatmap(table: pd.DataFrame, *, title: str, xlabel: str, ylabel: str, unit: str = "pts", limit: float | None = None):
+    plt = _pyplot()
+    limit = limit or _limit([table])
+    height = 0.75 + 0.32 * len(table.index)
+    figure, axis = plt.subplots(figsize=(1.2 + 0.85 * len(table.columns), height))
+    image = _heatmap_on(axis, table, limit)
+    _colorbar(figure, image, axis, unit)
     axis.set_title(title, loc="left")
     axis.set_xlabel(xlabel)
     axis.set_ylabel(ylabel)
     return figure
 
 
+def _heatmap_grid(
+    tables: dict[str, pd.DataFrame], *, title: str, xlabel: str, ylabel: str, unit: str = "pts", ncols: int = 3
+):
+    """One heatmap per backbone on a shared colour scale (so panels compare), one colorbar."""
+    plt = _pyplot()
+    limit = _limit(list(tables.values()))
+    first = next(iter(tables.values()))
+    ncols = min(ncols, len(tables))
+    nrows = int(np.ceil(len(tables) / ncols))
+    width = 1.6 + 0.62 * len(first.columns)
+    height = 0.9 + 0.3 * len(first.index)
+    figure, axes = plt.subplots(nrows, ncols, figsize=(width * ncols + 0.8, height * nrows + 0.4), squeeze=False)
+    for axis, (name, table) in zip(axes.flat, tables.items()):
+        image = _heatmap_on(axis, table, limit)
+        axis.set_title(name, loc="left")
+    for axis in axes.flat[len(tables):]:
+        axis.set_visible(False)
+    for axis in axes[-1]:
+        axis.set_xlabel(xlabel)
+    for axis in axes[:, 0]:
+        axis.set_ylabel(ylabel)
+    figure.suptitle(title, x=0.01, ha="left", fontsize=10, color=INK)
+    figure.tight_layout(rect=(0, 0, 0.93, 1))
+    _colorbar(figure, image, list(axes.flat[: len(tables)]), unit)
+    return figure
+
+
 def ror_gain(gain: pd.DataFrame):
     """Heatmap: PCA+ROR minus PCA (points of retention), mean over backbones."""
-    table = gain.pivot_table(index="quant_method", columns="target_dim", values="gain", aggfunc="mean")
-    table = table.loc[[q for q in QUANT_ORDER if q in table.index and q not in ("none", "fp16")]]
-    table.index = [QUANT_LABELS[q] for q in table.index]
     return _heatmap(
-        table,
+        _ror_table(gain),
         title="PCA+ROR minus PCA, mean over backbones",
         xlabel="Target dimension",
         ylabel="Quantizer",
     )
 
 
-def equal_count_gain(gain: pd.DataFrame):
-    """Heatmap: equal-count minus uniform int at the same bits (points), mean over backbones and dimensions."""
+def _ror_table(gain: pd.DataFrame) -> pd.DataFrame:
+    table = gain.pivot_table(index="quant_method", columns="target_dim", values="gain", aggfunc="mean")
+    table = table.loc[[q for q in QUANT_ORDER if q in table.index and q not in ("none", "fp16")]]
+    table.index = [QUANT_LABELS[q] for q in table.index]
+    return table
+
+
+def ror_gain_by_backbone(gain: pd.DataFrame):
+    """`ror_gain` per backbone, on one colour scale."""
+    return _heatmap_grid(
+        {b: _ror_table(gain[gain["backbone"] == b]) for b in backbone_order(gain)},
+        title="PCA+ROR minus PCA, per backbone (pts of retention)",
+        xlabel="Target dimension",
+        ylabel="Quantizer",
+    )
+
+
+def _equal_count_table(gain: pd.DataFrame) -> pd.DataFrame:
     table = gain.pivot_table(index="dr_method", columns="bits", values="gain", aggfunc="mean")
     table = table.loc[[m for m in ("none",) + DR_SERIES if m in table.index], sorted(table.columns, reverse=True)]
     table.columns = [f"{bits} bit" for bits in table.columns]
+    return table
+
+
+def equal_count_gain_by_backbone(gain: pd.DataFrame):
+    """`equal_count_gain` per backbone (mean over dimensions), on one colour scale."""
+    return _heatmap_grid(
+        {b: _equal_count_table(gain[gain["backbone"] == b]) for b in backbone_order(gain)},
+        title="Equal-count minus int at the same bits, per backbone (pts, mean over dimensions)",
+        xlabel="Bits per dimension",
+        ylabel="DR method",
+        ncols=5,
+    )
+
+
+def equal_count_gain(gain: pd.DataFrame):
+    """Heatmap: equal-count minus uniform int at the same bits (points), mean over backbones and dimensions."""
     return _heatmap(
-        table,
+        _equal_count_table(gain),
         title="Equal-count minus int, same bits",
         xlabel="Bits per dimension",
         ylabel="DR method",
@@ -287,17 +444,114 @@ def prefix_gap(gap: pd.DataFrame):
     return figure
 
 
-def task_deltas(table: pd.DataFrame):
-    """Heatmap: mean delta per task (points of nDCG@10) for selected cells."""
+def _task_name(task: str) -> str:
+    return task.removeprefix("Nano").removesuffix("Retrieval")
+
+
+def task_deltas(table: pd.DataFrame, baseline: pd.Series | None = None):
+    """Heatmap: mean delta per task (points of nDCG@10) for selected cells.
+
+    With `baseline` (task -> mean fp32 nDCG@10, the `fp32` column of
+    `analysis.task_scores`) each task's label carries its absolute starting point.
+    """
     table = table.sort_values(table.columns[0])
-    table.index = [task.removeprefix("Nano").removesuffix("Retrieval") for task in table.index]
+    labels = [_task_name(task) for task in table.index]
+    if baseline is not None:
+        labels = [f"{label} ({baseline[task]:.2f})" for label, task in zip(labels, table.index)]
+    table.index = labels
     return _heatmap(
         table,
-        title="Score change per task, mean over backbones",
+        title="Score change per task, mean over backbones (fp32 nDCG@10 in brackets)"
+        if baseline is not None
+        else "Score change per task, mean over backbones",
         xlabel="Configuration",
         ylabel="Task",
         unit="nDCG@10 pts",
     )
+
+
+def task_deltas_by_backbone(losses: pd.DataFrame, configs: list[str] | None = None):
+    """`task_deltas` per backbone (points of nDCG@10), tasks in one order across panels."""
+    configs = configs or list(dict.fromkeys(losses["config"]))
+    tables = {}
+    order = None
+    for backbone in backbone_order(losses):
+        part = losses[losses["backbone"] == backbone]
+        table = part.pivot_table(index="task", columns="config", values="delta", aggfunc="mean")[configs] * 100
+        order = order if order is not None else table.sort_values(configs[0]).index
+        table = table.reindex(order)
+        table.index = [_task_name(task) for task in table.index]
+        tables[backbone] = table
+    return _heatmap_grid(
+        tables,
+        title="Score change per task, per backbone (nDCG@10 pts)",
+        xlabel="Configuration",
+        ylabel="Task",
+        unit="nDCG@10 pts",
+        ncols=3,
+    )
+
+
+def corpus_size_loss(
+    losses: pd.DataFrame,
+    sizes: pd.DataFrame,
+    correlation: pd.DataFrame | None = None,
+    value: str = "retention",
+    ylabel: str | None = None,
+):
+    """Small multiples, one per named cell: per-task loss against corpus size (log).
+
+    Points are the task mean over backbones, the vertical bar spans the backbones.
+    With a `tier` column in `losses` (and `sizes`), each tier gets its own marker.
+    `correlation` (`analysis.size_correlation` on the same data, backbone "mean",
+    no tier column) puts Spearman's rho in each title.
+    """
+    plt = _pyplot()
+    configs = list(dict.fromkeys(losses["config"]))
+    keys = ["task"] + (["tier"] if "tier" in losses.columns else [])
+    sized = losses.merge(sizes.reset_index()[keys + ["n_documents"]], on=keys, how="left").dropna(subset=["n_documents"])
+    tiers = list(dict.fromkeys(sized["tier"])) if "tier" in sized.columns else [None]
+    styles = series_style([str(t) for t in tiers])
+    ncols = min(4, len(configs))
+    nrows = int(np.ceil(len(configs) / ncols))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(3.0 * ncols, 2.6 * nrows + 0.4), sharex=True, sharey=True, squeeze=False)
+    for axis, config in zip(axes.flat, configs):
+        part = sized[sized["config"] == config]
+        for tier in tiers:
+            own = part if tier is None else part[part["tier"] == tier]
+            stats = own.groupby("task").agg(
+                mean=(value, "mean"), low=(value, "min"), high=(value, "max"), n_documents=("n_documents", "first")
+            )
+            style = styles[str(tier)]
+            axis.vlines(stats["n_documents"], stats["low"], stats["high"], color=style["color"], alpha=0.35, linewidth=1.2)
+            axis.scatter(
+                stats["n_documents"], stats["mean"], s=22, edgecolors="white", linewidths=0.6, zorder=3,
+                label=None if tier is None else str(tier), **style,
+            )
+        axis.axhline(1.0 if value == "retention" else 0.0, color=MUTED, linewidth=1)
+        title = config
+        if correlation is not None:
+            match = correlation[(correlation["config"] == config) & (correlation["backbone"] == "mean")]
+            if "tier" in match.columns:
+                match = match[match["tier"].isna()]
+            if len(match) and not np.isnan(match["spearman"].iloc[0]):
+                title += f"\nrho = {match['spearman'].iloc[0]:+.2f} (p = {match['spearman_p'].iloc[0]:.2g}, n = {match['n_tasks'].iloc[0]})"
+        axis.set_title(title, loc="left", fontsize=8.5)
+        axis.set_xscale("log")
+    for axis in axes.flat[len(configs):]:
+        axis.set_visible(False)
+    for index, axis in enumerate(axes.flat[: len(configs)]):
+        # The bottom axis of every column, also when the panel under it is empty.
+        if index + ncols >= len(configs):
+            axis.xaxis.set_tick_params(labelbottom=True)
+            axis.set_xlabel("Documents in corpus")
+    for axis in axes[:, 0]:
+        axis.set_ylabel(ylabel or ("Retention" if value == "retention" else value))
+    if tiers != [None]:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        figure.legend(handles, labels, ncol=len(tiers), loc="upper left", bbox_to_anchor=(0.0, 1.02), fontsize=8)
+    figure.tight_layout(rect=(0, 0, 1, 0.97 if tiers != [None] else 1))
+    return figure
 
 
 def centring_check(table: pd.DataFrame, *, title: str):
@@ -321,4 +575,90 @@ def centring_check(table: pd.DataFrame, *, title: str):
     axis.set_ylabel("Top-10 overlap with fp32")
     axis.set_title(title, loc="left")
     axis.legend(fontsize=8, loc="lower right")
+    return figure
+
+
+# --- Tier comparison ---------------------------------------------------------------
+
+
+def tier_transfer(paired: pd.DataFrame, transfer: pd.DataFrame, small: str = "tier 1", large: str = "tier 2"):
+    """Every cell's retention (top) and mean nDCG@10 (bottom) in both tiers, one panel per backbone.
+
+    Colour and marker by DR method; the diagonal is "costs the same in both". Points
+    below it cost more on the large tier. Spearman of retention in the titles.
+    """
+    plt = _pyplot()
+    backbones = backbone_order(paired)
+    styles = {"none": {"color": INK, "marker": "o"}, **series_style(list(DR_SERIES))}
+    rho = transfer.set_index("backbone")["spearman_retention"]
+    figure, axes = plt.subplots(2, len(backbones), figsize=(2.6 * len(backbones), 5.6), squeeze=False)
+    for column, backbone in enumerate(backbones):
+        part = paired[paired["backbone"] == backbone]
+        for row, value in enumerate(("retention", "score")):
+            axis = axes[row, column]
+            for method in ["none", *DR_SERIES]:
+                own = part[part["dr_method"] == method]
+                if own.empty:
+                    continue
+                axis.scatter(
+                    own[f"{value}_small"], own[f"{value}_large"], s=12, alpha=0.75, linewidths=0,
+                    label="no DR" if method == "none" else method, **styles[method],
+                )
+            low = min(part[f"{value}_small"].min(), part[f"{value}_large"].min())
+            high = max(part[f"{value}_small"].max(), part[f"{value}_large"].max())
+            axis.plot([low, high], [low, high], color=MUTED, linewidth=1, zorder=0)
+            axis.set_xlabel(f"{'Retention' if value == 'retention' else 'nDCG@10'}, {small}")
+            if column == 0:
+                axis.set_ylabel(f"{'Retention' if value == 'retention' else 'Mean nDCG@10'}, {large}")
+        axes[0, column].set_title(f"{backbone}\nrho = {rho[backbone]:.3f}", loc="left")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, ncol=len(labels), loc="upper left", bbox_to_anchor=(0.0, 1.04), fontsize=8)
+    figure.tight_layout()
+    return figure
+
+
+def scale_cost(table: pd.DataFrame, small: str = "tier 1", large: str = "tier 2"):
+    """Heatmap: retention change large - small (points), mean over backbones, per DR cell and quantizer."""
+    table = table.copy()
+    table.index = ["full" if method == "none" else f"{method}-{dim}" for method, dim in table.index]
+    table.columns = [QUANT_LABELS[q] for q in table.columns]
+    return _heatmap(
+        table,
+        title=f"Retention {large} minus {small}, mean over backbones (pts)",
+        xlabel="Quantizer",
+        ylabel="DR method and dimension",
+    )
+
+
+def budget_choice(choice: pd.DataFrame, small: str = "tier 1", large: str = "tier 2"):
+    """Per backbone: the large tier's best mean nDCG@10 per budget, and what the small
+    tier's pick scores there. The gap between the two lines is the regret."""
+    plt = _pyplot()
+    backbones = backbone_order(choice)
+    styles = series_style(backbones)
+    ncols = min(3, len(backbones))
+    nrows = int(np.ceil(len(backbones) / ncols))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(4.0 * ncols, 3.2 * nrows), sharey=True, squeeze=False)
+    for axis, backbone in zip(axes.flat, backbones):
+        part = choice[choice["backbone"] == backbone].sort_values("budget")
+        color = styles[backbone]["color"]
+        axis.plot(part["budget"], part["large_best"], drawstyle="steps-post", color=color, linewidth=2,
+                  label=f"best on {large}")
+        axis.plot(part["budget"], part["large_score_of_small_pick"], drawstyle="steps-post", color=INK,
+                  linewidth=1.2, linestyle="--", label=f"{small}'s pick, scored on {large}")
+        differ = part[~part["same"]]
+        axis.scatter(differ["budget"], differ["large_score_of_small_pick"], s=14, color=INK, zorder=3,
+                     label="different pick")
+        _bytes_axis(axis, part["budget"])
+        same = part["same"].mean()
+        axis.set_title(f"{backbone}  (same pick {same:.0%}, max regret {part['regret'].max():.1f} pts)",
+                       loc="left", fontsize=9)
+        axis.set_xlabel("Budget, bytes per vector")
+    for axis in axes.flat[len(backbones):]:
+        axis.set_visible(False)
+    for axis in axes[:, 0]:
+        axis.set_ylabel(f"Mean nDCG@10, {large}")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, ncol=3, loc="upper left", bbox_to_anchor=(0.0, 1.04), fontsize=8)
+    figure.tight_layout()
     return figure

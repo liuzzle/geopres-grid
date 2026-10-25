@@ -8,7 +8,9 @@ per-cell summary `cell_summary` makes from it, and return plain DataFrames;
 Retention is a cell's score divided by its backbone's fp32 baseline on the same
 (task, split, subset), averaged over tasks -- the mean of ratios, so a task with a
 low baseline weighs as much as one with a high one. Differences between cells are
-reported in points of retention (x100).
+reported in points of retention (x100). Every relative table has an absolute twin
+(mean main score, nDCG@10 for retrieval) or carries the absolute scores as columns,
+so a reader sees both.
 
 `centring_check` is separate: it reads cached embeddings, not results, and tests
 one explanation for PCA losing to truncation at high dimension (§23.2).
@@ -16,6 +18,7 @@ one explanation for PCA losing to truncation at high dimension (§23.2).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -43,12 +46,32 @@ DR_ORDER: tuple[str, ...] = ("none", "truncate", "pca", "pca_ror", "random_proje
 CELL_KEYS: tuple[str, ...] = ("backbone", "dr_method", "target_dim", "quant_method")
 SCORE_KEYS: tuple[str, ...] = ("backbone", "task", "split", "subset")
 
+REPRESENTATIVE_CELLS: dict[str, tuple[str, int, str]] = {
+    "full/binary": ("none", 0, "binary"),
+    "full/int2": ("none", 0, "int2"),
+    "full/EC-2": ("none", 0, "equal_count_2"),
+    "pca-128": ("pca", 128, "none"),
+    "pca-64": ("pca", 64, "none"),
+    "truncate-128": ("truncate", 128, "none"),
+    "truncate-256/int4": ("truncate", 256, "int4"),
+    "pca_ror-128/EC-4": ("pca_ror", 128, "equal_count_4"),
+}
+"""Cells followed per task (`task_deltas`, `task_losses`): quantization alone, DR
+alone and two combinations, as (dr_method, target_dim, quant_method)."""
+
 
 def backbone_order(frame: pd.DataFrame) -> list[str]:
     """Backbones present in `frame`, in registry order, so colours follow the model."""
     present = set(frame["backbone"])
     ordered = [backbone.key for backbone in all_backbones() if backbone.key in present]
     return ordered + sorted(present - set(ordered))
+
+
+def read_results(paths: Iterable[str | Path]) -> pd.DataFrame:
+    """Tidy results tables read as one. A row in two of them (same run, task, split,
+    subset: a baseline next to a rerun that also carries it) is kept once."""
+    frame = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+    return frame.drop_duplicates(["run_id", "task", "split", "subset"], ignore_index=True)
 
 
 def one_pca_mean(frame: pd.DataFrame, pca_mean: str | None = None) -> pd.DataFrame:
@@ -103,9 +126,12 @@ def cell_summary(rows: pd.DataFrame) -> pd.DataFrame:
     """One row per (backbone, DR, dimension, quantizer): means over tasks.
 
     The baseline appears as the `none`/0/`none` cell with retention 1. `n_tasks`
-    is kept so a cell with a failed task is visible rather than averaged over fewer.
+    is kept so a cell with a failed task is visible rather than averaged over fewer,
+    and `pca_mean` so a PCA cell says which mode it is.
     """
     keys = list(CELL_KEYS) + ["bits_per_dim", "bytes_per_vector", "compression_factor"]
+    if "pca_mean" in rows.columns:  # one mode per table (`one_pca_mean`); kept so it is visible
+        keys.append("pca_mean")
     cells = (
         rows.groupby(keys, dropna=False)
         .agg(
@@ -151,29 +177,57 @@ def noise_floor(rows: pd.DataFrame, quant_methods: Iterable[str] = ("fp16", "int
     }
 
 
-def quantization_only(cells: pd.DataFrame) -> pd.DataFrame:
-    """Retention of every quantizer at full dimension: backbone x quantizer."""
-    table = cells[cells["dr_method"] == "none"].pivot(index="backbone", columns="quant_method", values="retention")
+def native_dims(cells: pd.DataFrame) -> pd.Series:
+    """Each backbone's native dimension, from its fp32 baseline cell (4 bytes a coordinate)."""
+    baseline = cells[(cells["dr_method"] == "none") & (cells["quant_method"] == "none")]
+    return (baseline.set_index("backbone")["bytes_per_vector"] // 4).astype(int).rename("native_dim")
+
+
+def quantization_only(cells: pd.DataFrame, value: str = "retention") -> pd.DataFrame:
+    """Every quantizer at full dimension: backbone x quantizer.
+
+    `value="retention"` (default) or `"score"` for the mean nDCG@10; the `none`
+    column is the fp32 baseline either way.
+    """
+    table = cells[cells["dr_method"] == "none"].pivot(index="backbone", columns="quant_method", values=value)
     return table.loc[backbone_order(cells), [q for q in QUANT_ORDER if q in table.columns]]
 
 
-def reduction_only(cells: pd.DataFrame) -> pd.DataFrame:
-    """fp32 retention of every DR method by dimension: (backbone, method) x dimension."""
+def reduction_only(cells: pd.DataFrame, value: str = "retention") -> pd.DataFrame:
+    """Every DR method by dimension at fp32: (backbone, method) x dimension.
+
+    Each row ends at its backbone's native dimension with the fp32 baseline (no
+    reduction): retention 1, or the baseline score. The native column is empty for
+    the backbones whose native dimension is another one.
+    """
     selected = cells[(cells["quant_method"] == "none") & (cells["dr_method"] != "none")]
-    return selected.pivot_table(index=["backbone", "dr_method"], columns="target_dim", values="retention")
+    table = selected.pivot_table(index=["backbone", "dr_method"], columns="target_dim", values=value)
+    baseline = cells[(cells["dr_method"] == "none") & (cells["quant_method"] == "none")].set_index("backbone")[value]
+    natives = native_dims(cells)
+    for backbone, method in table.index:
+        table.loc[(backbone, method), natives[backbone]] = baseline[backbone]
+    return table[sorted(table.columns)]
 
 
 def method_gain(cells: pd.DataFrame, column: str, better: str, worse: str, keys: Iterable[str]) -> pd.DataFrame:
     """`better - worse` in points of retention, matched on every other cell key.
 
     `column` is what differs between the two (`dr_method` or `quant_method`);
-    `keys` are the remaining cell keys to match on.
+    `keys` are the remaining cell keys to match on. `better_score` and
+    `worse_score` are the two cells' mean scores (nDCG@10), so the gain can be
+    read against where both stand.
     """
     keys = list(keys)
-    left = cells[cells[column] == better].set_index(keys)["retention"]
-    right = cells[cells[column] == worse].set_index(keys)["retention"]
-    gain = ((left - right) * 100).dropna().rename("gain").reset_index()
-    return gain
+    left = cells[cells[column] == better].set_index(keys)
+    right = cells[cells[column] == worse].set_index(keys)
+    gain = pd.DataFrame(
+        {
+            "gain": (left["retention"] - right["retention"]) * 100,
+            "better_score": left["score"],
+            "worse_score": right["score"],
+        }
+    )
+    return gain.dropna().reset_index()
 
 
 def ror_gain(cells: pd.DataFrame) -> pd.DataFrame:
@@ -224,21 +278,303 @@ def budget_frontier(cells: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(fronts, ignore_index=True)
 
 
-def task_deltas(rows: pd.DataFrame, selection: dict[str, tuple[str, int, str]]) -> pd.DataFrame:
-    """Mean delta over backbones (points) per task, for named cells.
+def task_losses(rows: pd.DataFrame, selection: dict[str, tuple[str, int, str]]) -> pd.DataFrame:
+    """One row per (backbone, task, named cell): baseline, score, delta, retention.
 
-    `selection` maps a column name to (dr_method, target_dim, quant_method); use
-    target_dim 0 for no DR.
+    `selection` maps a name to (dr_method, target_dim, quant_method); use
+    target_dim 0 for no DR. The long form behind `task_deltas` and `task_scores`,
+    and the per-backbone view of them. Keeps `pca_mean`, so a combined table of two
+    tiers still says which PCA cells it holds.
     """
-    columns = {}
+    parts = []
     for name, (dr_method, target_dim, quant_method) in selection.items():
         selected = rows[
             (rows["dr_method"] == dr_method)
             & (rows["target_dim"] == target_dim)
             & (rows["quant_method"] == quant_method)
         ]
-        columns[name] = selected.groupby("task")["delta"].mean() * 100
-    return pd.DataFrame(columns)
+        parts.append(selected.assign(config=name))
+    columns = ["config", "backbone", "task", "split", "subset", "baseline", "main_score", "delta", "retention"]
+    losses = pd.concat(parts, ignore_index=True)
+    if "pca_mean" in losses.columns:
+        columns.append("pca_mean")
+    return losses[columns].rename(columns={"main_score": "score"})
+
+
+def task_deltas(rows: pd.DataFrame, selection: dict[str, tuple[str, int, str]]) -> pd.DataFrame:
+    """Mean delta over backbones (points) per task, for named cells (`task_losses`)."""
+    losses = task_losses(rows, selection)
+    table = losses.pivot_table(index="task", columns="config", values="delta", aggfunc="mean") * 100
+    return table[[name for name in selection if name in table.columns]]
+
+
+def task_scores(rows: pd.DataFrame, selection: dict[str, tuple[str, int, str]]) -> pd.DataFrame:
+    """The absolute twin of `task_deltas`: mean score over backbones per task, with
+    the fp32 baseline as the first column."""
+    losses = task_losses(rows, selection)
+    table = losses.pivot_table(index="task", columns="config", values="score", aggfunc="mean")
+    table = table[[name for name in selection if name in table.columns]]
+    baseline = rows[rows["kind"] == "baseline"].groupby("task")["main_score"].mean()
+    table.insert(0, "fp32", baseline)
+    return table
+
+
+# --- Corpus size -------------------------------------------------------------------
+
+
+def corpus_sizes(splits: dict[str, str]) -> pd.DataFrame:
+    """Documents and queries per task, from MTEB's packaged descriptive statistics.
+
+    `splits` maps a task name to its evaluated split (`task_splits`). Offline: the statistics
+    ship with `mteb`, nothing is downloaded. An aggregate task (CQADupstackRetrieval)
+    is scored per sub-task, each against its own corpus, and its score is the mean
+    over them, so its size is the mean of its sub-tasks' sizes. A task without
+    statistics gets NaN rather than a guess.
+    """
+    import mteb
+
+    def count(values, side):
+        # Older statistics (Touche2020) have no num_documents; the text statistics
+        # still give the count as total length / average length.
+        if values.get(f"num_{side}") is not None:
+            return values[f"num_{side}"]
+        text = values.get(f"{side}_text_statistics") or {}
+        if text.get("average_text_length"):
+            return round(text["total_text_length"] / text["average_text_length"])
+        return None
+
+    def stats(task, split):
+        values = (task.metadata.descriptive_stats or {}).get(split) or {}
+        return count(values, "documents"), count(values, "queries")
+
+    rows = []
+    for name, split in splits.items():
+        task = mteb.get_task(name)
+        parts = list(getattr(task.metadata, "tasks", None) or [task])
+        sizes = [stats(part, split) for part in parts]
+        documents = [d for d, _ in sizes if d is not None]
+        queries = [q for _, q in sizes if q is not None]
+        rows.append(
+            {
+                "task": name,
+                "split": split,
+                "n_documents": float(np.mean(documents)) if len(documents) == len(parts) else np.nan,
+                "n_queries": float(np.mean(queries)) if len(queries) == len(parts) else np.nan,
+                "n_subtasks": len(parts),
+                "source": "mteb descriptive_stats",
+            }
+        )
+    return pd.DataFrame(rows).set_index("task")
+
+
+def task_splits(rows: pd.DataFrame) -> dict[str, str]:
+    """The evaluated split of every task in `rows` (one per task, or it raises)."""
+    splits = rows.groupby("task")["split"].unique()
+    several = splits[splits.map(len) > 1]
+    if len(several):
+        raise ValueError(f"tasks evaluated on more than one split: {several.to_dict()}")
+    return {task: values[0] for task, values in splits.items()}
+
+
+def size_correlation(
+    losses: pd.DataFrame,
+    sizes: pd.DataFrame,
+    value: str = "retention",
+    groups: Iterable[str] = ("config",),
+) -> pd.DataFrame:
+    """Spearman and Pearson (on log10 documents) of a per-task loss against corpus size.
+
+    `losses` from `task_losses` (optionally with a `tier` column), `sizes` from
+    `corpus_sizes` indexed by task (with `tier` too when tasks repeat across tiers).
+    Per group in `groups`, once on the task mean over backbones (`backbone="mean"`)
+    and once per backbone. A group holding PCA cells of both `pca_mean` modes is
+    refused: it would correlate two different reductions as one.
+    """
+    from scipy import stats
+
+    groups = list(groups)
+    size_keys = ["task"] + (["tier"] if "tier" in sizes.reset_index().columns and "tier" in losses.columns else [])
+    data = losses.merge(sizes.reset_index()[size_keys + ["n_documents"]], on=size_keys, how="left")
+    data = data.dropna(subset=["n_documents", value])
+    rows = []
+    for key, group in data.groupby(groups):
+        if "pca_mean" in group.columns and group["pca_mean"].dropna().nunique() > 1:
+            raise ValueError(f"{dict(zip(groups, np.atleast_1d(key)))}: PCA cells of both pca_mean modes")
+        per_task = group.groupby(size_keys).agg(loss=(value, "mean"), n_documents=("n_documents", "first"))
+        parts = [("mean", per_task)] + [
+            (backbone, part.groupby(size_keys).agg(loss=(value, "mean"), n_documents=("n_documents", "first")))
+            for backbone, part in group.groupby("backbone")
+        ]
+        for backbone, part in parts:
+            size = np.log10(part["n_documents"].to_numpy())
+            loss = part["loss"].to_numpy()
+            if len(part) < 3 or np.ptp(size) == 0 or np.ptp(loss) == 0:
+                rho = p_rho = r = p_r = np.nan
+            else:
+                rho, p_rho = stats.spearmanr(size, loss)
+                r, p_r = stats.pearsonr(size, loss)
+            rows.append(
+                {
+                    **dict(zip(groups, np.atleast_1d(key))),
+                    "backbone": backbone,
+                    "value": value,
+                    "n_tasks": len(part),
+                    "spearman": float(rho),
+                    "spearman_p": float(p_rho),
+                    "pearson_log10": float(r),
+                    "pearson_p": float(p_r),
+                    "min_documents": float(part["n_documents"].min()),
+                    "max_documents": float(part["n_documents"].max()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def dataset_name(task: str) -> str:
+    """`NanoClimateFeverRetrieval` and `ClimateFEVER` both -> `climatefever`: the BEIR
+    dataset a task samples, to pair a NanoBEIR task with its full counterpart."""
+    return task.removeprefix("Nano").removesuffix("Retrieval").lower()
+
+
+def paired_tiers(losses: pd.DataFrame, small: str, large: str) -> pd.DataFrame:
+    """The same dataset at two corpus sizes: retention in `large` minus in `small`.
+
+    `losses` from `task_losses` with a `tier` column. Rows are matched on backbone,
+    named cell and `dataset_name`; `task` is the `large` tier's name, so the result
+    joins that tier's `corpus_sizes`. A cell whose PCA mode differs between the two
+    is refused (§29).
+    """
+    keys = ["config", "backbone", "dataset"]
+    frame = losses.assign(dataset=losses["task"].map(dataset_name))
+    left = frame[frame["tier"] == small].set_index(keys)
+    right = frame[frame["tier"] == large].set_index(keys)
+    paired = right[["task"]].join(
+        pd.DataFrame(
+            {
+                "retention_small": left["retention"],
+                "retention_large": right["retention"],
+                "score_small": left["score"],
+                "score_large": right["score"],
+            }
+        ),
+        how="inner",
+    ).dropna(subset=["retention_small", "retention_large"])
+    if "pca_mean" in frame.columns:
+        modes = pd.DataFrame({"small": left["pca_mean"], "large": right["pca_mean"]}).loc[paired.index]
+        mixed = modes.dropna(how="all")
+        mixed = mixed[mixed["small"].ne(mixed["large"])]
+        if len(mixed):
+            raise ValueError(f"PCA cells in different pca_mean modes: {sorted(set(mixed.index.get_level_values(0)))}")
+    paired["retention_change"] = paired["retention_large"] - paired["retention_small"]
+    return paired.reset_index()
+
+
+# --- Tier comparison ---------------------------------------------------------------
+
+
+def shared_datasets(small: pd.DataFrame, large: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Both tiers' rows restricted to the BEIR datasets they share (`dataset_name`),
+    so a difference between them is corpus size, not a different task mix."""
+    shared = set(small["task"].map(dataset_name)) & set(large["task"].map(dataset_name))
+    return small[small["task"].map(dataset_name).isin(shared)], large[large["task"].map(dataset_name).isin(shared)]
+
+
+def tier_cells(small: pd.DataFrame, large: pd.DataFrame) -> pd.DataFrame:
+    """One row per cell present in both tiers: retention and score in each, and the change.
+
+    `small` and `large` are `cell_summary` tables (of `shared_datasets` rows, for a
+    like-for-like comparison). Each must hold one `pca_mean` mode (`one_pca_mean`);
+    a PCA cell in different modes in the two tiers is refused (§29).
+    """
+    keys = list(CELL_KEYS) + ["bytes_per_vector"]
+    columns = ["retention", "score", "n_tasks", "label"]
+    paired = small.set_index(keys)[columns].join(
+        large.set_index(keys)[columns[:-1]], lsuffix="_small", rsuffix="_large", how="inner"
+    )
+    paired = paired.rename(columns={"label_small": "label"}).reset_index()
+    for name, table in (("small", small), ("large", large)):
+        if "pca_mean" in table.columns:
+            modes = set(table.loc[table["dr_method"].isin(PCA_METHODS), "pca_mean"].dropna())
+            paired.attrs[f"pca_mean_{name}"] = sorted(modes)
+    if paired.attrs.get("pca_mean_small", []) and paired.attrs.get("pca_mean_large", []):
+        if paired.attrs["pca_mean_small"] != paired.attrs["pca_mean_large"]:
+            raise ValueError(
+                f"PCA cells in pca_mean {paired.attrs['pca_mean_small']} vs {paired.attrs['pca_mean_large']}; "
+                "drop them or pick one mode for both"
+            )
+    paired["retention_change"] = paired["retention_large"] - paired["retention_small"]
+    return paired
+
+
+def rank_transfer(paired: pd.DataFrame) -> pd.DataFrame:
+    """Spearman of retention and of score between the tiers, per backbone and pooled.
+
+    The fp32 baseline is left out (retention 1 in both by construction). Pooled
+    retention ranks cells of all backbones together; pooled score would mostly rank
+    the backbones, so it is reported but says less.
+    """
+    from scipy import stats
+
+    cells = paired[~((paired["dr_method"] == "none") & (paired["quant_method"] == "none"))]
+    rows = []
+    for backbone, part in [*cells.groupby("backbone"), ("pooled", cells)]:
+        rho, p = stats.spearmanr(part["retention_small"], part["retention_large"])
+        rho_score, _ = stats.spearmanr(part["score_small"], part["score_large"])
+        rows.append(
+            {
+                "backbone": backbone,
+                "n_cells": len(part),
+                "spearman_retention": float(rho),
+                "spearman_p": float(p),
+                "spearman_score": float(rho_score),
+                "mean_change": float(part["retention_change"].mean()),
+                "median_change": float(part["retention_change"].median()),
+                "q05_change": float(part["retention_change"].quantile(0.05)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def scale_cost(paired: pd.DataFrame) -> pd.DataFrame:
+    """Retention change large - small (points), mean over backbones:
+    (DR method, dimension) x quantizer. Negative: the cell costs more at scale."""
+    table = paired.pivot_table(
+        index=["dr_method", "target_dim"], columns="quant_method", values="retention_change", aggfunc="mean"
+    ) * 100
+    order = [m for m in DR_ORDER if m in table.index.get_level_values(0)]
+    table = table.reindex(sorted(table.index, key=lambda key: (order.index(key[0]), key[1])))
+    return table[[q for q in QUANT_ORDER if q in table.columns]]
+
+
+def budget_choice(paired: pd.DataFrame) -> pd.DataFrame:
+    """Would the small tier pick the same cell? Per backbone and storage budget.
+
+    For every budget (each bytes-per-vector size in the grid) the best cell at or
+    under it by each tier's mean score; `large_score_of_small_pick` is what the small
+    tier's choice scores on the large tier, and `regret` (points of nDCG@10) how much
+    below the large tier's own best that is. Ties go to the smaller, then the
+    alphabetically first cell, so the choice is deterministic.
+    """
+    rows = []
+    for backbone, group in paired.groupby("backbone"):
+        for budget in sorted(group["bytes_per_vector"].unique()):
+            within = group[group["bytes_per_vector"] <= budget].sort_values(["bytes_per_vector", "label"])
+            small_pick = within.loc[within["score_small"].idxmax()]
+            large_pick = within.loc[within["score_large"].idxmax()]
+            rows.append(
+                {
+                    "backbone": backbone,
+                    "budget": int(budget),
+                    "small_pick": small_pick["label"],
+                    "large_pick": large_pick["label"],
+                    "same": small_pick["label"] == large_pick["label"],
+                    "small_score_of_small_pick": small_pick["score_small"],
+                    "large_score_of_small_pick": small_pick["score_large"],
+                    "large_best": large_pick["score_large"],
+                    "regret": (large_pick["score_large"] - small_pick["score_large"]) * 100,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 # --- PCA centring ------------------------------------------------------------------
