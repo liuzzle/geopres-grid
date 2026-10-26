@@ -86,6 +86,10 @@ EVALUATION_RESULTS_PATH = os.getenv(
     "EVALUATION_RESULTS_PATH", os.path.join(STORAGE_PATH, "evaluation_results")
 )
 
+IMPRESSO_PATH = os.getenv("IMPRESSO_PATH", os.path.join(STORAGE_PATH, "impresso"))
+"""The Impresso IR test set as Andrianos sent it (`crosslingual/DE/docs.csv`, ...).
+Not public, so it is never in the repo; copy the folder here on every machine."""
+
 TRAINED_MODELS_PATH = os.getenv(
     "TRAINED_MODELS_PATH", os.path.join(STORAGE_PATH, "trained_models")
 )

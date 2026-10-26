@@ -24,7 +24,7 @@ from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
 from geopres_grid.reducers import PostProcessingPipeline
 from geopres_grid.results import write_run_record
 
-Tier = Literal["tier0", "tier1", "tier2", "nonretrieval", "mldr"]
+Tier = Literal["tier0", "tier1", "tier2", "nonretrieval", "mldr", "impresso"]
 
 NANOBEIR_TASKS: tuple[str, ...] = (
     "NanoArguAnaRetrieval",
@@ -92,12 +92,23 @@ MLDR_TASKS: tuple[str, ...] = ("MultiLongDocRetrieval",)
 Added 07.10.2026; at 512 tokens it measured truncation, so it waited on LFM2.5
 leaving and `PRIMARY_MAX_SEQ_LENGTH` rising to 8192."""
 
+IMPRESSO_TASKS: tuple[str, ...] = (
+    "ImpressoCrosslingualDE",
+    "ImpressoMultilingualDE",
+    "ImpressoCrosslingualFR",
+    "ImpressoMultilingualFR",
+)
+"""Andrianos' Impresso IR test set (logging.md §25, §36), custom tasks defined in
+`geopres_grid.impresso` and not known to `mteb.get_task`; `load_tasks` builds them.
+Kept apart from `impresso.TASKS` so this module stays importable without `mteb`."""
+
 TIER_TASKS: dict[Tier, tuple[str, ...]] = {
     "tier0": ("NanoArguAnaRetrieval", "STSBenchmark"),
     "tier1": NANOBEIR_TASKS,
     "tier2": BEIR_TASKS,
     "nonretrieval": NON_RETRIEVAL_TASKS,
     "mldr": MLDR_TASKS,
+    "impresso": IMPRESSO_TASKS,
 }
 """Task sets by cost. Tiers 0-2 grow by orders of magnitude and run on fewer
 grid cells as they grow; `nonretrieval` and `mldr` are supplementary sets
@@ -179,8 +190,12 @@ def load_tasks(names: Any) -> list[Any]:
     import mteb
 
     use_cached_dataset_configs()
+    if any(name in IMPRESSO_TASKS for name in names):
+        from geopres_grid.impresso import TASKS as impresso_tasks
     return [
-        mteb.get_task(name, eval_splits=list(TASK_EVAL_SPLITS[name]) if name in TASK_EVAL_SPLITS else None)
+        impresso_tasks[name]()
+        if name in IMPRESSO_TASKS
+        else mteb.get_task(name, eval_splits=list(TASK_EVAL_SPLITS[name]) if name in TASK_EVAL_SPLITS else None)
         for name in names
     ]
 
