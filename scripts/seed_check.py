@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tier", choices=sorted(TIER_TASKS), default="tier1")
     parser.add_argument("--task-type", default="Retrieval")
     parser.add_argument("--pca-mean", choices=("restore", "subtract"), help="Keep the PCA cells of this mode")
+    parser.add_argument(
+        "--quant-method", action="append",
+        help="Keep only these quantizers (repeatable), e.g. `none` when only fp32 was rerun under extra seeds; "
+        "the noise floor still uses every quantizer",
+    )
     return parser
 
 
@@ -325,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     rows = seeded_rows(pd.read_csv(args.results, low_memory=False), args.tier, args.task_type, args.pca_mean)
+    floors = noise_floors(rows, default_seed_cells(per_seed_cells(rows)))
+    if args.quant_method:
+        rows = rows[rows["quant_method"].isin(args.quant_method)]
     per_seed = per_seed_cells(rows)
     seeds = sorted(per_seed.loc[per_seed["dr_method"].isin(SEEDED_DR_METHODS), "dr_seed"].unique())
     if len(seeds) < 2:
@@ -334,7 +342,6 @@ def main(argv: list[str] | None = None) -> int:
     spread = seed_spread(per_seed, rows)
     gains = comparisons(per_seed)
     ranks, wins, front = ranking(default, mean), winners(default, mean), frontier(default, mean)
-    floors = noise_floors(rows, default)
 
     per_seed.to_csv(out / "seed_cells.csv", index=False)
     spread.to_csv(out / "seed_spread.csv", index=False)

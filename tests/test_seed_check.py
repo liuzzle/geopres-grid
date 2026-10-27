@@ -78,6 +78,17 @@ def test_main_writes_every_table(tmp_path):
     assert np.isfinite(summary["std_points"]["max"])
 
 
+def test_a_quantizer_filter_keeps_the_noise_floor(tmp_path):
+    source = tmp_path / "results.csv"
+    results().to_csv(source, index=False)
+    assert main([str(source), "--quant-method", "none"]) == 0
+    out = tmp_path / "analysis"
+    assert set(pd.read_csv(out / "seed_cells.csv")["quant_method"]) == {"none"}
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["n_seeded_cells"] == 2  # random selection and projection at 64, fp32 only
+    assert summary["noise_floor_points"]["cell_fp16_int8_max"] == 0  # from the fp16 / int8 cells left out
+
+
 def test_a_single_seed_is_refused(tmp_path):
     frame = results()
     source = tmp_path / "results.csv"
