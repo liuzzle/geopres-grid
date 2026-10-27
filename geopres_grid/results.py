@@ -118,12 +118,19 @@ def _config_columns(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _add_task_metadata(frame: pd.DataFrame) -> pd.DataFrame:
-    """Task type and main-score name from the pinned mteb, for tasks it knows."""
+def add_task_metadata(frame: pd.DataFrame) -> pd.DataFrame:
+    """Task type and main-score name from the pinned mteb, for tasks it knows.
+
+    The custom Impresso tasks are not in mteb's registry; their metadata is ours.
+    """
     import mteb
 
-    known: dict[str, tuple[str, str]] = {}
-    for name in sorted(set(frame["task"])):
+    from geopres_grid.impresso import TASKS as impresso_tasks
+
+    known: dict[str, tuple[str, str]] = {
+        name: (task.metadata.type, task.metadata.main_score) for name, task in impresso_tasks.items()
+    }
+    for name in sorted(set(frame["task"]) - set(known)):
         try:
             metadata = mteb.get_tasks(tasks=[name])[0].metadata
         except (KeyError, IndexError, ValueError):
@@ -165,7 +172,7 @@ def load_results(results_root: str | Path, *, metrics: tuple[str, ...] = ()) -> 
         )
     frame = pd.DataFrame(rows, columns=[*CONFIG_COLUMNS, "task", "split", "subset", "main_score",
                                         "mteb_version", "dataset_revision", *metrics])
-    return _add_task_metadata(frame)
+    return add_task_metadata(frame)
 
 
 def comparison_table(frame: pd.DataFrame, *, tasks: list[str] | None = None) -> pd.DataFrame:
@@ -291,7 +298,7 @@ def load_upstream_results(results_dir: str | Path) -> pd.DataFrame:
     if frame.empty:
         return frame
     intrinsic = frame["task"].isin(UPSTREAM_INTRINSIC)
-    scored = _add_task_metadata(
+    scored = add_task_metadata(
         frame[~intrinsic].drop(columns=["task_type", "main_score_name"], errors="ignore").copy()
     )
     return pd.concat([scored, frame[intrinsic]], ignore_index=True)

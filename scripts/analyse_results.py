@@ -23,6 +23,13 @@ See logging §23 for what the tier-1 numbers say.
 Several tables are read as one (a rerun next to the run it extends, e.g. tier 1's
 restore PCA cells: `results.csv results_restore.csv --pca-mean restore`); a row
 present in two of them (same run, task, split, subset) is kept once.
+
+`--tier` keeps one tier's tasks, which a table collected over every tier needs
+(`--tier impresso`), and `--metric recall_at_5` analyses that column in place of
+the main score (collect it with `collect_results.py --metric recall_at_5`). The
+corpus-size tables and the figures are skipped for the Impresso tier (four custom
+tasks, no MTEB statistics) and for any metric but nDCG@10 (the figures are labelled
+nDCG@10).
 """
 
 from __future__ import annotations
@@ -35,6 +42,8 @@ from pathlib import Path
 import pandas as pd
 
 from geopres_grid import analysis
+from geopres_grid.evaluation import TIER_TASKS
+from geopres_grid.results import add_task_metadata
 
 TASK_DELTA_CELLS = analysis.REPRESENTATIVE_CELLS
 
@@ -44,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("results", type=Path, nargs="+", help="Tidy results.csv from collect_results.py")
     parser.add_argument("--out", type=Path, help="Output directory (default: <first results dir>/analysis)")
     parser.add_argument("--task-type", default="Retrieval")
+    parser.add_argument("--tier", choices=sorted(TIER_TASKS), help="Keep only this tier's tasks")
+    parser.add_argument(
+        "--metric",
+        help="Analyse this column of the table (e.g. recall_at_5) in place of the main score (nDCG@10)",
+    )
     parser.add_argument("--no-plots", action="store_true", help="Tables only; no matplotlib needed")
     parser.add_argument(
         "--pca-mean",
@@ -59,11 +73,21 @@ def main(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     frame = analysis.read_results(args.results)
+    if args.tier:
+        frame = frame[frame["task"].isin(TIER_TASKS[args.tier])]
+        if frame["task_type"].isna().any():  # collected before the Impresso tasks were known
+            frame = add_task_metadata(frame.drop(columns=["task_type", "main_score_name"]))
+    if args.metric:
+        if args.metric not in frame.columns:
+            raise SystemExit(f"no column {args.metric!r}; collect the table with --metric {args.metric}")
+        frame = frame.assign(main_score=frame[args.metric]).dropna(subset=["main_score"])
+    with_sizes = args.tier != "impresso"
+    with_plots = not args.no_plots and not args.metric and with_sizes
     rows = analysis.scored_rows(frame, task_type=args.task_type, pca_mean=args.pca_mean)
     other = frame[frame["task_type"] != args.task_type]
     cells = analysis.cell_summary(rows)
     losses = analysis.task_losses(rows, TASK_DELTA_CELLS)
-    sizes = analysis.corpus_sizes(analysis.task_splits(rows))
+    sizes = analysis.corpus_sizes(analysis.task_splits(rows)) if with_sizes else None
 
     tables = {
         "cells": cells,
@@ -79,9 +103,10 @@ def main(argv: list[str] | None = None) -> int:
         "task_deltas": analysis.task_deltas(rows, TASK_DELTA_CELLS),
         "task_scores": analysis.task_scores(rows, TASK_DELTA_CELLS),
         "task_losses": losses,
-        "corpus_sizes": sizes,
-        "corpus_size_correlation": analysis.size_correlation(losses, sizes),
     }
+    if with_sizes:
+        tables["corpus_sizes"] = sizes
+        tables["corpus_size_correlation"] = analysis.size_correlation(losses, sizes)
     for name, table in tables.items():
         table.to_csv(out / f"{name}.csv", index=not isinstance(table.index, pd.RangeIndex))
 
@@ -99,8 +124,9 @@ def main(argv: list[str] | None = None) -> int:
         "noise_int4_ec4": noise_4bit,
         "cells_above_baseline_by_0.5pts": int((cells["delta"] > 0.005).sum()),
         "pca_mean": sorted(rows.loc[rows["dr_method"].isin(analysis.PCA_METHODS), "pca_mean"].dropna().unique()),
-        "corpus_documents": [float(sizes["n_documents"].min()), float(sizes["n_documents"].max())],
     }
+    if with_sizes:
+        summary["corpus_documents"] = [float(sizes["n_documents"].min()), float(sizes["n_documents"].max())]
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
     print(json.dumps(summary, indent=2))
@@ -113,11 +139,12 @@ def main(argv: list[str] | None = None) -> int:
               tables["equal_count_gain"].pivot_table(index="dr_method", columns="bits", values="gain").round(1))
         print("\nTruncate - random selection, fp32 (pts):\n",
               tables["prefix_gap"].pivot_table(index="backbone", columns="target_dim", values="gain").round(1))
-        correlation = tables["corpus_size_correlation"]
-        print("\nRetention vs log10 corpus size, Spearman (mean over backbones, then per backbone):\n",
-              correlation.pivot_table(index="config", columns="backbone", values="spearman").round(2))
+        if with_sizes:
+            correlation = tables["corpus_size_correlation"]
+            print("\nRetention vs log10 corpus size, Spearman (mean over backbones, then per backbone):\n",
+                  correlation.pivot_table(index="config", columns="backbone", values="spearman").round(2))
 
-    if not args.no_plots:
+    if with_plots:
         from geopres_grid import plots
 
         figures = {

@@ -135,3 +135,15 @@ def test_a_task_runs_from_a_warm_cache_with_no_model(impresso_dir, tmp_path):
     assert scores["main_score"] == scores["ndcg_at_10"] == pytest.approx(1.0)
     assert scores["recall_at_5"] == pytest.approx(1.0)
     assert scored.task_results[0].get_score() > 0.5
+
+
+def test_results_know_the_impresso_task_type():
+    import pandas as pd
+
+    from geopres_grid.results import add_task_metadata
+
+    frame = add_task_metadata(pd.DataFrame({"task": ["ImpressoMultilingualDE", "NotATask"]}))
+
+    assert frame["task_type"].tolist()[0] == "Retrieval"
+    assert frame["main_score_name"].tolist()[0] == "ndcg_at_10"
+    assert frame["task_type"].isna().tolist()[1]
