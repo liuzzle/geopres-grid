@@ -146,7 +146,10 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   (`analysis.one_pca_mean`). `Binary` dequantizes to ±1, so the mean is added on its
   `reconstruction_scale`; any new quantizer whose levels are not input values needs one.
 - **Whether a quantizer shares one grid across coordinates decides how much PCA+ROR
-  matters.** `EqualCount` (Kisako et al. §3.4: one global table) and `Binary` share
-  one; `UniformAffine` fits a range per dimension and absorbs most of PCA's variance
-  imbalance itself. Do not make `EqualCount` per-dimension "for consistency" -- the
-  global table is the published method.
+  matters -- and the target dimension decides its sign.** `EqualCount` (Kisako et al.
+  §3.4: one global table) and `Binary` share one; `UniformAffine` fits a range per
+  dimension and absorbs most of PCA's variance imbalance itself. Do not make
+  `EqualCount` per-dimension "for consistency" -- the global table is the published
+  method. On tiers 1, 2 and Impresso, ROR helps binary / EC-2 at 256-512 dims and
+  hurts at 64 (crossing between 128 and 256), helps int2 from 128 up, and is within
+  ±1 pt at >= 4 bits (logging §57). Never state the ROR gain without the dimension.

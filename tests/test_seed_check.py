@@ -83,3 +83,21 @@ def test_a_single_seed_is_refused(tmp_path):
     source = tmp_path / "results.csv"
     frame[frame["dr_seed"].isna()].to_csv(source, index=False)
     assert main([str(source)]) == 1
+
+
+def test_ror_against_pca_pairs_seed_k_with_seed_k():
+    """Same solver seed on both sides, so only the rotation differs between the pair."""
+    rows = []
+    for task, base in BASELINE.items():
+        rows.append(row(task, base, kind="baseline"))
+        for seed, pca, ror in ((None, 0.70, 0.75), (1, 0.71, 0.70), (2, 0.69, 0.74)):
+            for method, retention in (("pca", pca), ("pca_ror", ror)):
+                rows.append(row(task, retention * base, method, 512, "binary", seed) | {"pca_mean": "restore"})
+    per_seed = per_seed_cells(seeded_rows(pd.DataFrame(rows), "tier1", pca_mean="restore"))
+
+    gain = seeded_gain(per_seed, "ror_vs_pca", "dr_method", "pca_ror", "pca").iloc[0]
+
+    assert gain["n_seeds"] == 3
+    assert gain["gain_mean"] == pytest.approx((5 - 1 + 5) / 3)
+    assert gain["gain_default"] == pytest.approx(5.0)
+    assert gain["sign_flips"] == 1

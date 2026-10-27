@@ -14,7 +14,8 @@ Writes, into `--out` (default: `analysis/` next to the input):
   seeds, and where the default seed's value sits among them
 - `comparisons.csv` -- method differences the thesis reports (random projection vs
   random selection, truncation vs both, equal-count vs uniform int), per seed and
-  averaged, with how often a single seed gets the sign wrong
+  averaged, with how often a single seed gets the sign wrong; with `--pca-mean`,
+  also PCA+ROR vs PCA paired by seed, i.e. the rotation's own seed effect
 - `ranking.csv` -- per backbone, the cell ranking under the default seed against the
   ranking under the seed mean; `winners.csv` -- the best DR method per (dimension,
   quantizer) under each; `frontier.csv` -- budget-frontier cells under each
@@ -44,6 +45,7 @@ SIZE_KEYS = ["bits_per_dim", "bytes_per_vector", "compression_factor"]
 
 COMPARISONS: tuple[tuple[str, str, str, str], ...] = (
     ("rp_vs_rs", "dr_method", "random_projection", "random_selection"),
+    ("ror_vs_pca", "dr_method", "pca_ror", "pca"),
     ("truncate_vs_rs", "dr_method", "truncate", "random_selection"),
     ("truncate_vs_rp", "dr_method", "truncate", "random_projection"),
     ("ec8_vs_int8", "quant_method", "equal_count_8", "int8"),
@@ -51,7 +53,9 @@ COMPARISONS: tuple[tuple[str, str, str, str], ...] = (
     ("ec2_vs_int2", "quant_method", "equal_count_2", "int2"),
 )
 """(name, column that differs, better, worse): a gain is `better - worse`, matched
-on every other cell key. The quantizer comparisons are restricted to seeded methods."""
+on every other cell key. The quantizer comparisons are restricted to seeded methods.
+`ror_vs_pca` needs `--pca-mean`; seed k of `pca_ror` and of `pca` share scikit-learn's
+PCA solver seed, so the paired gain varies only the rotation (logging §57)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
