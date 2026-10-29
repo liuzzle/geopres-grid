@@ -79,8 +79,13 @@ def _symmetric_texts(task: Any, split: str) -> int | None:
 
 
 def estimate_task(task: Any, backbone: Any, split: str | None = None, itemsize: int = 4) -> dict[str, Any]:
-    """Return document/query row counts and fp32 byte estimates for one task."""
-    split = split or task.metadata.eval_splits[0]
+    """Return document/query row counts and fp32 byte estimates for one task.
+
+    The split defaults to the first of `task.eval_splits`, where `load_tasks` puts
+    `TASK_EVAL_SPLITS`; `metadata.eval_splits` keeps the declared ones, so MLDR
+    would be counted on `dev` instead of the `test` split precompute caches.
+    """
+    split = split or (getattr(task, "eval_splits", None) or task.metadata.eval_splits)[0]
     if getattr(task.metadata, "type", "Retrieval") not in ("Retrieval", None):
         texts = _symmetric_texts(task, split) or 0
         return _row(task, split, backbone, itemsize, documents=0, queries=texts)

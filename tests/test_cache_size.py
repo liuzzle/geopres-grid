@@ -21,6 +21,27 @@ def test_estimate_task_reports_side_counts_and_fp32_bytes():
     assert result["total_bytes"] == 160
 
 
+def test_estimate_task_counts_the_overridden_split_not_the_declared_first():
+    """MLDR declares `dev` before `test`; `load_tasks` keeps only `test` (logging.md §70)."""
+    task = SimpleNamespace(
+        name="MultiLongDocRetrieval",
+        eval_splits=["test"],
+        metadata=SimpleNamespace(name="MultiLongDocRetrieval", eval_splits=["dev", "test"]),
+        dataset={
+            "en": {
+                "dev": {"corpus": [{}] * 4, "queries": [{}] * 1},
+                "test": {"corpus": [{}] * 4, "queries": [{}] * 3},
+            }
+        },
+    )
+    backbone = SimpleNamespace(key="fake", native_dim=2)
+
+    result = estimate_task(task, backbone)
+
+    assert result["split"] == "test"
+    assert result["queries"] == 3
+
+
 def test_estimate_task_handles_missing_split():
     task = SimpleNamespace(
         name="Fake",

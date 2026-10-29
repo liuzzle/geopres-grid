@@ -1,7 +1,11 @@
 #!/bin/bash
 # Precompute one backbone's cache for one task set, in the environment it needs.
 #
-#   sbatch scripts/slurm/precompute.sh <backbone> [tier]      # tier defaults to tier1
+#   sbatch scripts/slurm/precompute.sh <backbone> [tier] [precompute.py options]
+#
+# The tier defaults to tier1; anything after it goes to scripts/precompute.py, e.g.
+#   sbatch scripts/slurm/precompute.sh harrier-06b mldr --subset de --batch-size 16
+# (`--batch-size` is recorded, not hashed: a smaller one keeps the encode hash.)
 #
 # Submit from the repo root; `.env` there sets PROJECT_ROOT and STORAGE_PATH.
 #
@@ -26,8 +30,9 @@
 
 set -euo pipefail
 
-backbone=${1:?usage: sbatch scripts/slurm/precompute.sh <backbone> [tier]}
+backbone=${1:?usage: sbatch scripts/slurm/precompute.sh <backbone> [tier] [precompute.py options]}
 tier=${2:-tier1}
+shift $(($# < 2 ? $# : 2))
 
 case "$backbone" in
     mgte | harrier-270m | harrier-06b) project=. ;;
@@ -41,10 +46,10 @@ export PATH="$HOME/.local/bin:$PATH"
 export HF_HOME=${HF_HOME:-/scratch/$USER/hf}
 
 cd "${SLURM_SUBMIT_DIR:-.}"
-echo "Starting $backbone / $tier in $project on $(hostname): $(date)"
+echo "Starting $backbone / $tier $* in $project on $(hostname): $(date)"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
 uv run --frozen --project "$project" python scripts/precompute.py \
-    --backbone "$backbone" --tier "$tier" --device cuda
+    --backbone "$backbone" --tier "$tier" --device cuda "$@"
 
 echo "Finished: $(date)"

@@ -249,3 +249,48 @@ def test_precompute_refuses_a_chunk_size_below_one(tmp_path):
             cache_root=tmp_path,
             chunk_size=0,
         )
+
+
+def test_mldr_precompute_defaults_to_small_chunks():
+    """At 200k one chunk would be MLDR's whole English corpus (logging.md §70)."""
+    from geopres_grid.precompute import DEFAULT_CHUNK_SIZE
+    from scripts.precompute import build_parser, default_chunk_size
+
+    assert build_parser().parse_args(["--tier", "mldr"]).chunk_size is None
+    assert default_chunk_size("mldr") == 2_000
+    assert default_chunk_size("tier2") == default_chunk_size(None) == DEFAULT_CHUNK_SIZE
+    assert build_parser().parse_args(["--tier", "mldr", "--chunk-size", "500"]).chunk_size == 500
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["mgte"], "--backbone mgte --tier tier1 --device cuda"),
+        (["mgte", "mldr"], "--backbone mgte --tier mldr --device cuda"),
+        (
+            ["harrier-06b", "mldr", "--subset", "de", "--batch-size", "16"],
+            "--backbone harrier-06b --tier mldr --device cuda --subset de --batch-size 16",
+        ),
+    ],
+)
+def test_precompute_job_passes_extra_options_to_the_script(tmp_path, arguments, expected):
+    """`precompute.sh <backbone> [tier] [options]`, with `uv` and `nvidia-smi` stubbed."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "slurm" / "precompute.sh"
+    bin_dir = tmp_path / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "uv").write_text('#!/bin/bash\necho "uv $*"\n')
+    (bin_dir / "nvidia-smi").write_text("#!/bin/bash\n")
+    for stub in bin_dir.iterdir():
+        stub.chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path), "SLURM_SUBMIT_DIR": str(tmp_path)}
+
+    output = subprocess.run(
+        ["bash", str(script), *arguments], env=env, capture_output=True, text=True, check=True
+    ).stdout
+
+    uv_line = next(line for line in output.splitlines() if line.startswith("uv "))
+    assert uv_line.endswith(f"python scripts/precompute.py {expected}")

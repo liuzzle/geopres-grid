@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 
 from sentence_transformers import SentenceTransformer
 
@@ -22,6 +23,18 @@ from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, r
 from geopres_grid.evaluation import TIER_TASKS, baseline_pass, load_tasks, task_names
 from geopres_grid.identity import EncodeConfig
 from geopres_grid.precompute import DEFAULT_CHUNK_SIZE, leaf_tasks, precompute_task_cache
+
+TIER_CHUNK_SIZES = {"mldr": 2_000}
+"""`--chunk-size` defaults that differ from `DEFAULT_CHUNK_SIZE`. MLDR's documents
+average ~13k characters, and about half of them reach the 8192-token cap in every
+language but English and Chinese: at 200k one chunk would be all of MLDR's English
+corpus, days of harrier-06b's GPU time with nothing committed before a time limit.
+2,000 German documents are about an hour on harrier-06b (logging.md §70)."""
+
+
+def default_chunk_size(tier: str | None) -> int:
+    """`--chunk-size` when none is given: the tier's own, else `DEFAULT_CHUNK_SIZE`."""
+    return TIER_CHUNK_SIZES.get(tier, DEFAULT_CHUNK_SIZE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=DEFAULT_CHUNK_SIZE,
-        help="Passages encoded and committed per step; a rerun resumes at the first uncommitted chunk",
+        help=f"Passages encoded and committed per step; a rerun resumes at the first uncommitted "
+        f"chunk. Default {DEFAULT_CHUNK_SIZE}, or per tier: {TIER_CHUNK_SIZES}",
     )
     parser.add_argument("--max-seq-length", type=int, default=PRIMARY_MAX_SEQ_LENGTH)
     parser.add_argument("--dtype", default="float32")
@@ -54,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if bool(args.task) == bool(args.tier):
         raise SystemExit("pass either --task (repeatable) or --tier")
+    if args.chunk_size is None:
+        args.chunk_size = default_chunk_size(args.tier)
     backbone = get(args.backbone)
     require_runnable(backbone)
 
@@ -112,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 hf_subsets=args.subset,
                 batch_size=args.batch_size,
                 chunk_size=args.chunk_size,
-                progress=lambda line: print(line, flush=True),
+                progress=lambda line: print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}", flush=True),
             )
             for block in summary["copied_blocks"]:
                 print(f"Copied and verified {block} from {CORPUS_COPIES[summary['task']]}")
