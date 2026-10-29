@@ -30,6 +30,11 @@ the main score (collect it with `collect_results.py --metric recall_at_5`). The
 corpus-size tables and the figures are skipped for the Impresso tier (four custom
 tasks, no MTEB statistics) and for any metric but nDCG@10 (the figures are labelled
 nDCG@10).
+
+The `nonretrieval` tier holds three task types; analyse each on its own, e.g.
+`--tier nonretrieval --task-type STS` (then `Classification`, `Clustering`), each
+into its own `--out`. Their main scores are Spearman, accuracy and V-measure, so the
+tables are in those units; the corpus-size tables and the figures are skipped.
 """
 
 from __future__ import annotations
@@ -81,9 +86,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.metric not in frame.columns:
             raise SystemExit(f"no column {args.metric!r}; collect the table with --metric {args.metric}")
         frame = frame.assign(main_score=frame[args.metric]).dropna(subset=["main_score"])
-    with_sizes = args.tier != "impresso"
-    with_plots = not args.no_plots and not args.metric
+    # Corpus sizes are retrieval's (documents per task); STS, classification and
+    # clustering have none, and size_correlation on all-NaN sizes has no columns.
+    retrieval = args.task_type == "Retrieval"
+    with_sizes = args.tier != "impresso" and retrieval
+    with_plots = not args.no_plots and not args.metric and retrieval  # figures are labelled nDCG@10
     rows = analysis.scored_rows(frame, task_type=args.task_type, pca_mean=args.pca_mean)
+    if rows.empty:
+        found = sorted(frame["task_type"].dropna().unique())
+        raise SystemExit(f"no {args.task_type} rows; --task-type is one of {found}")
     other = frame[frame["task_type"] != args.task_type]
     cells = analysis.cell_summary(rows)
     losses = analysis.task_losses(rows, TASK_DELTA_CELLS)

@@ -98,6 +98,11 @@ After any dependency change, `scripts/smoke_backbones.py` is the regression test
   only** — no split, no subset, no prompt type. Four of the five backbones use
   asymmetric prompts, so a query and a document with the same text collide. Do not
   use it unmodified.
+- **mteb 2.15.1's classification reads labels row by row under `datasets` 5**, where
+  `dataset["label"]` is a lazy `Column`: ~25 min of pure overhead per AmazonPolarity
+  evaluation, more than the rest of the `nonretrieval` tier. `load_tasks` patches the
+  two methods (`evaluation.use_fast_classification_labels`, identical results, tested
+  against the originals). Re-check it whenever mteb or datasets moves.
 - **MTEB's `CompressionWrapper` refits min/max inside every `encode` call**, so
   documents get a different affine map per 50k corpus chunk than queries do, and it
   returns un-dequantized integer levels. Quantization calibration must be fitted

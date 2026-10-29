@@ -181,6 +181,60 @@ def use_cached_dataset_configs() -> None:
     loaders.get_dataset_config_names = config_names
 
 
+def use_fast_classification_labels() -> None:
+    """Read classification labels in one Arrow pass instead of row by row. Same results.
+
+    In `datasets` 5, `dataset["label"]` is a lazy `Column` that decodes one row per
+    item whenever it is iterated; mteb 2.15.1 was written for the list it used to be.
+    Two places then cost more than everything else in the `nonretrieval` tier
+    (logging.md §74):
+
+    - `_calculate_scores` hands the test labels to nine sklearn metrics, each
+      converting them several times: ~560 row decodes per test text per evaluation,
+      ~30 min for AmazonPolarity's 400k (measured 95 of 102 s at 20k).
+    - `_undersample_data` reads `dataset[i][label]` for every shuffled index of the
+      whole train split, ten times per evaluation (AmazonPolarity: 3.6M rows).
+
+    Both are replaced by the same computation on a plain label list: same shuffle,
+    same indices, same metrics. `_undersample_data` also stops once every label has
+    its `samples_per_label`, after which the original appends nothing. Idempotent.
+    """
+    from collections import defaultdict
+
+    from mteb.abstasks.classification import AbsTaskClassification
+
+    if getattr(AbsTaskClassification._calculate_scores, "geopres_fast", False):
+        return
+    calculate_scores = AbsTaskClassification._calculate_scores
+    undersample_data = AbsTaskClassification._undersample_data
+
+    def _calculate_scores(self: Any, y_test: Any, y_pred: Any) -> Any:
+        return calculate_scores(self, np.asarray(y_test[:]), y_pred)
+
+    def _undersample_data(self: Any, dataset: Any, experiment_num: int, idxs: list[int] | None = None) -> Any:
+        if idxs is None:
+            idxs = list(range(len(dataset)))
+        np.random.RandomState(self.seed).shuffle(idxs)  # the original's shuffle, in place
+        labels = dataset[self.label_column_name][:]
+        missing = len(set(labels))
+        counts: dict[Any, int] = defaultdict(int)
+        sampled_idxs = []
+        for i in idxs:
+            if counts[labels[i]] < self.samples_per_label:
+                sampled_idxs.append(i)
+                counts[labels[i]] += 1
+                missing -= counts[labels[i]] == self.samples_per_label
+                if not missing:
+                    break
+        return dataset.select(sampled_idxs), idxs, sampled_idxs
+
+    _calculate_scores.geopres_fast = True  # type: ignore[attr-defined]
+    _calculate_scores.original = calculate_scores  # type: ignore[attr-defined]
+    _undersample_data.original = undersample_data  # type: ignore[attr-defined]
+    AbsTaskClassification._calculate_scores = _calculate_scores
+    AbsTaskClassification._undersample_data = _undersample_data
+
+
 def load_tasks(names: Any) -> list[Any]:
     """MTEB task objects for `names`, with `TASK_EVAL_SPLITS` applied.
 
@@ -190,6 +244,7 @@ def load_tasks(names: Any) -> list[Any]:
     import mteb
 
     use_cached_dataset_configs()
+    use_fast_classification_labels()
     if any(name in IMPRESSO_TASKS for name in names):
         from geopres_grid.impresso import TASKS as impresso_tasks
     return [
