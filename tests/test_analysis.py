@@ -248,6 +248,21 @@ def test_paired_tiers_match_a_nano_task_to_its_full_dataset():
         analysis.paired_tiers(mixed, "tier1", "tier2")
 
 
+def test_all_cells_orders_rows_and_columns_and_keeps_absolute_twin():
+    cells = analysis.cell_summary(analysis.scored_rows(make_frame()))
+    retention = analysis.all_cells(cells)
+    score = analysis.all_cells(cells, "score")
+    assert list(retention.columns) == ["none", "binary"]
+    assert list(retention.loc["mdenseon"].index) == [
+        ("none", 0), ("truncate", 4), ("pca", 4), ("pca_ror", 4), ("random_selection", 4)
+    ]
+    assert list(retention.index.get_level_values("backbone").unique()) == analysis.backbone_order(cells)
+    assert retention.loc[("mgte", "none", 0), "none"] == 1
+    assert np.isclose(retention.loc[("mgte", "pca_ror", 4), "binary"], 0.7)
+    assert np.isclose(score.loc[("mgte", "none", 0), "none"], 0.6)  # mean of 0.8 and 0.4
+    assert np.isnan(retention.loc[("mgte", "truncate", 4), "binary"])  # not in the frame
+
+
 def test_every_figure_draws():
     pytest.importorskip("matplotlib")
     from geopres_grid import plots
@@ -264,6 +279,9 @@ def test_every_figure_draws():
         plots.budget_frontier(cells, frontier),
         plots.budget_frontier_by_backbone(cells, frontier),
         plots.ror_gain_by_backbone(analysis.ror_gain(cells)),
+        plots.ror_gain(analysis.ror_gain(cells)),
+        plots.all_cells(analysis.all_cells(cells), analysis.all_cells(cells, "score")),
+        plots.all_cells_by_backbone(analysis.all_cells(cells), analysis.all_cells(cells, "score")),
         plots.task_deltas(analysis.task_deltas(rows, selection), analysis.task_scores(rows, selection)["fp32"]),
         plots.task_deltas_by_backbone(losses, list(selection)),
         plots.corpus_size_loss(losses, sizes, analysis.size_correlation(losses, sizes)),

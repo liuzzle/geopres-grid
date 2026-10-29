@@ -209,6 +209,24 @@ def reduction_only(cells: pd.DataFrame, value: str = "retention") -> pd.DataFram
     return table[sorted(table.columns)]
 
 
+def all_cells(cells: pd.DataFrame, value: str = "retention") -> pd.DataFrame:
+    """Every cell of the grid: (backbone, DR method, dimension) x quantizer.
+
+    Rows per backbone start with no reduction (`none`, 0), then `DR_ORDER` by
+    dimension; columns follow `QUANT_ORDER`. `value="retention"` (default) or
+    `"score"` for the mean nDCG@10. A cell the table does not hold stays empty.
+    """
+    table = cells.pivot_table(index=["backbone", "dr_method", "target_dim"], columns="quant_method", values=value)
+    methods = [m for m in DR_ORDER if m in set(cells["dr_method"])] + sorted(set(cells["dr_method"]) - set(DR_ORDER))
+    order = [
+        (backbone, method, dim)
+        for backbone in backbone_order(cells)
+        for method in methods
+        for dim in sorted(cells.loc[(cells["backbone"] == backbone) & (cells["dr_method"] == method), "target_dim"].unique())
+    ]
+    return table.reindex(index=pd.MultiIndex.from_tuples(order, names=table.index.names), columns=[q for q in QUANT_ORDER if q in table.columns])
+
+
 def method_gain(cells: pd.DataFrame, column: str, better: str, worse: str, keys: Iterable[str]) -> pd.DataFrame:
     """`better - worse` in points of retention, matched on every other cell key.
 

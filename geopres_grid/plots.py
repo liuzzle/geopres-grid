@@ -295,8 +295,12 @@ def budget_frontier_by_backbone(cells: pd.DataFrame, frontier: pd.DataFrame):
     return figure
 
 
-def _heatmap_on(axis, table: pd.DataFrame, limit: float):
-    """Draw `table` as an annotated diverging heatmap on `axis`; returns the image."""
+def _heatmap_on(axis, table: pd.DataFrame, limit: float, scores: pd.DataFrame | None = None, fontsize: float = 8):
+    """Draw `table` as an annotated diverging heatmap on `axis`; returns the image.
+
+    With `scores` (same shape, mean nDCG@10) each cell also carries the absolute
+    score under its difference, smaller, so a loss reads against where it lands.
+    """
     values = table.to_numpy(dtype=float)
     image = axis.imshow(values, cmap=_diverging_cmap(), vmin=-limit, vmax=limit, aspect="auto")
     axis.grid(False)
@@ -311,11 +315,17 @@ def _heatmap_on(axis, table: pd.DataFrame, limit: float):
     axis.tick_params(length=0)
     for spine in axis.spines.values():
         spine.set_visible(False)
+    absolute = None if scores is None else scores.reindex(index=table.index, columns=table.columns).to_numpy(dtype=float)
     for (row, column), value in np.ndenumerate(values):
         if np.isnan(value):
             continue
-        strong = abs(value) > 0.55 * limit
-        axis.text(column, row, f"{value:+.1f}", ha="center", va="center", fontsize=8, color="white" if strong else INK)
+        color = "white" if abs(value) > 0.55 * limit else INK
+        if absolute is None or np.isnan(absolute[row, column]):
+            axis.text(column, row, f"{value:+.1f}", ha="center", va="center", fontsize=fontsize, color=color)
+            continue
+        axis.text(column, row - 0.17, f"{value:+.1f}", ha="center", va="center", fontsize=fontsize, color=color)
+        axis.text(column, row + 0.22, f"{absolute[row, column]:.3f}", ha="center", va="center",
+                  fontsize=fontsize - 2, color=color, alpha=0.85)
     return image
 
 
@@ -330,12 +340,21 @@ def _limit(tables: list[pd.DataFrame]) -> float:
     return max([float(np.nanmax(np.abs(t.to_numpy(dtype=float)))) for t in tables if t.size] + [1e-9])
 
 
-def _heatmap(table: pd.DataFrame, *, title: str, xlabel: str, ylabel: str, unit: str = "pts", limit: float | None = None):
+def _heatmap(
+    table: pd.DataFrame,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    unit: str = "pts",
+    limit: float | None = None,
+    scores: pd.DataFrame | None = None,
+):
     plt = _pyplot()
     limit = limit or _limit([table])
-    height = 0.75 + 0.32 * len(table.index)
+    height = 0.75 + (0.32 if scores is None else 0.45) * len(table.index)
     figure, axis = plt.subplots(figsize=(1.2 + 0.85 * len(table.columns), height))
-    image = _heatmap_on(axis, table, limit)
+    image = _heatmap_on(axis, table, limit, scores)
     _colorbar(figure, image, axis, unit)
     axis.set_title(title, loc="left")
     axis.set_xlabel(xlabel)
@@ -344,19 +363,27 @@ def _heatmap(table: pd.DataFrame, *, title: str, xlabel: str, ylabel: str, unit:
 
 
 def _heatmap_grid(
-    tables: dict[str, pd.DataFrame], *, title: str, xlabel: str, ylabel: str, unit: str = "pts", ncols: int = 3
+    tables: dict[str, pd.DataFrame],
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    unit: str = "pts",
+    ncols: int = 3,
+    scores: dict[str, pd.DataFrame] | None = None,
 ):
-    """One heatmap per backbone on a shared colour scale (so panels compare), one colorbar."""
+    """One heatmap per backbone on a shared colour scale (so panels compare), one colorbar.
+    `scores` (same keys) adds each cell's absolute score, as in `_heatmap_on`."""
     plt = _pyplot()
     limit = _limit(list(tables.values()))
     first = next(iter(tables.values()))
     ncols = min(ncols, len(tables))
     nrows = int(np.ceil(len(tables) / ncols))
-    width = 1.6 + 0.62 * len(first.columns)
-    height = 0.9 + 0.3 * len(first.index)
+    width = 1.6 + (0.62 if scores is None else 0.7) * len(first.columns)
+    height = 0.9 + (0.3 if scores is None else 0.42) * len(first.index)
     figure, axes = plt.subplots(nrows, ncols, figsize=(width * ncols + 0.8, height * nrows + 0.4), squeeze=False)
     for axis, (name, table) in zip(axes.flat, tables.items()):
-        image = _heatmap_on(axis, table, limit)
+        image = _heatmap_on(axis, table, limit, None if scores is None else scores[name])
         axis.set_title(name, loc="left")
     for axis in axes.flat[len(tables):]:
         axis.set_visible(False)
@@ -365,23 +392,26 @@ def _heatmap_grid(
     for axis in axes[:, 0]:
         axis.set_ylabel(ylabel)
     figure.suptitle(title, x=0.01, ha="left", fontsize=10, color=INK)
-    figure.tight_layout(rect=(0, 0, 0.93, 1))
+    top = 1 - 0.35 / figure.get_figheight()  # room for the suptitle on tall figures
+    figure.tight_layout(rect=(0, 0, 0.93, top))
     _colorbar(figure, image, list(axes.flat[: len(tables)]), unit)
     return figure
 
 
 def ror_gain(gain: pd.DataFrame):
-    """Heatmap: PCA+ROR minus PCA (points of retention), mean over backbones."""
+    """Heatmap: PCA+ROR minus PCA (points of retention), mean over backbones, with
+    PCA+ROR's mean nDCG@10 under each difference."""
     return _heatmap(
         _ror_table(gain),
-        title="PCA+ROR minus PCA, mean over backbones",
+        title="PCA+ROR minus PCA, mean over backbones (small: PCA+ROR nDCG@10)",
         xlabel="Target dimension",
         ylabel="Quantizer",
+        scores=_ror_table(gain, "better_score"),
     )
 
 
-def _ror_table(gain: pd.DataFrame) -> pd.DataFrame:
-    table = gain.pivot_table(index="quant_method", columns="target_dim", values="gain", aggfunc="mean")
+def _ror_table(gain: pd.DataFrame, value: str = "gain") -> pd.DataFrame:
+    table = gain.pivot_table(index="quant_method", columns="target_dim", values=value, aggfunc="mean")
     table = table.loc[[q for q in QUANT_ORDER if q in table.index and q not in ("none", "fp16")]]
     table.index = [QUANT_LABELS[q] for q in table.index]
     return table
@@ -389,16 +419,18 @@ def _ror_table(gain: pd.DataFrame) -> pd.DataFrame:
 
 def ror_gain_by_backbone(gain: pd.DataFrame):
     """`ror_gain` per backbone, on one colour scale."""
+    backbones = backbone_order(gain)
     return _heatmap_grid(
-        {b: _ror_table(gain[gain["backbone"] == b]) for b in backbone_order(gain)},
-        title="PCA+ROR minus PCA, per backbone (pts of retention)",
+        {b: _ror_table(gain[gain["backbone"] == b]) for b in backbones},
+        title="PCA+ROR minus PCA, per backbone (pts of retention; small: PCA+ROR nDCG@10)",
         xlabel="Target dimension",
         ylabel="Quantizer",
+        scores={b: _ror_table(gain[gain["backbone"] == b], "better_score") for b in backbones},
     )
 
 
-def _equal_count_table(gain: pd.DataFrame) -> pd.DataFrame:
-    table = gain.pivot_table(index="dr_method", columns="bits", values="gain", aggfunc="mean")
+def _equal_count_table(gain: pd.DataFrame, value: str = "gain") -> pd.DataFrame:
+    table = gain.pivot_table(index="dr_method", columns="bits", values=value, aggfunc="mean")
     table = table.loc[[m for m in ("none",) + DR_SERIES if m in table.index], sorted(table.columns, reverse=True)]
     table.columns = [f"{bits} bit" for bits in table.columns]
     return table
@@ -406,12 +438,14 @@ def _equal_count_table(gain: pd.DataFrame) -> pd.DataFrame:
 
 def equal_count_gain_by_backbone(gain: pd.DataFrame):
     """`equal_count_gain` per backbone (mean over dimensions), on one colour scale."""
+    backbones = backbone_order(gain)
     return _heatmap_grid(
-        {b: _equal_count_table(gain[gain["backbone"] == b]) for b in backbone_order(gain)},
-        title="Equal-count minus int at the same bits, per backbone (pts, mean over dimensions)",
+        {b: _equal_count_table(gain[gain["backbone"] == b]) for b in backbones},
+        title="Equal-count minus int at the same bits, per backbone (pts, mean over dimensions; small: equal-count nDCG@10)",
         xlabel="Bits per dimension",
         ylabel="DR method",
         ncols=5,
+        scores={b: _equal_count_table(gain[gain["backbone"] == b], "better_score") for b in backbones},
     )
 
 
@@ -419,10 +453,70 @@ def equal_count_gain(gain: pd.DataFrame):
     """Heatmap: equal-count minus uniform int at the same bits (points), mean over backbones and dimensions."""
     return _heatmap(
         _equal_count_table(gain),
-        title="Equal-count minus int, same bits",
+        title="Equal-count minus int, same bits (small: equal-count nDCG@10)",
         xlabel="Bits per dimension",
         ylabel="DR method",
+        scores=_equal_count_table(gain, "better_score"),
     )
+
+
+def _all_cells_panel(retention: pd.DataFrame, score: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """One backbone's (or the mean's) block of `analysis.all_cells`, as points of
+    retention lost against fp32 and the absolute score, with readable row and column names."""
+    loss = (retention - 1) * 100
+    names = ["full" if method == "none" else f"{method}-{int(dim)}" for method, dim in loss.index]
+    columns = [QUANT_LABELS.get(q, q) for q in loss.columns]
+    loss, score = loss.copy(), score.reindex(index=retention.index, columns=retention.columns).copy()
+    for table in (loss, score):
+        table.index, table.columns = names, columns
+    return loss, score
+
+
+def _method_separators(axes, index: list[str]) -> None:
+    """A white rule between DR methods, so the 21 rows read as six blocks."""
+    methods = [name.rsplit("-", 1)[0] for name in index]
+    for row in range(1, len(methods)):
+        if methods[row] != methods[row - 1]:
+            for axis in axes:
+                axis.axhline(row - 0.5, color="white", linewidth=2.5)
+
+
+def all_cells(retention: pd.DataFrame, score: pd.DataFrame):
+    """Heatmap of the whole grid, mean over backbones: every (DR, dimension) by every
+    quantizer, coloured by points of retention against fp32, with the mean nDCG@10
+    under each. Takes `analysis.all_cells` for retention and for score."""
+    mean_retention = retention.groupby(level=["dr_method", "target_dim"], sort=False).mean()
+    mean_score = score.groupby(level=["dr_method", "target_dim"], sort=False).mean()
+    loss, absolute = _all_cells_panel(mean_retention, mean_score)
+    figure = _heatmap(
+        loss,
+        title="Every configuration, mean over backbones: pts of retention vs fp32 (small: nDCG@10)",
+        xlabel="Quantizer",
+        ylabel="Reduction",
+        unit="pts of retention",
+        scores=absolute,
+    )
+    _method_separators(figure.axes[:1], list(loss.index))
+    return figure
+
+
+def all_cells_by_backbone(retention: pd.DataFrame, score: pd.DataFrame, ncols: int = 3):
+    """`all_cells` per backbone on one colour scale."""
+    tables, scores = {}, {}
+    for backbone in retention.index.get_level_values("backbone").unique():
+        tables[backbone], scores[backbone] = _all_cells_panel(retention.loc[backbone], score.loc[backbone])
+    figure = _heatmap_grid(
+        tables,
+        title="Every configuration per backbone: pts of retention vs fp32 (small: nDCG@10)",
+        xlabel="Quantizer",
+        ylabel="Reduction",
+        unit="pts of retention",
+        ncols=ncols,
+        scores=scores,
+    )
+    for axis, table in zip(figure.axes, tables.values()):
+        _method_separators([axis], list(table.index))
+    return figure
 
 
 def prefix_gap(gap: pd.DataFrame):

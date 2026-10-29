@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"no column {args.metric!r}; collect the table with --metric {args.metric}")
         frame = frame.assign(main_score=frame[args.metric]).dropna(subset=["main_score"])
     with_sizes = args.tier != "impresso"
-    with_plots = not args.no_plots and not args.metric and with_sizes
+    with_plots = not args.no_plots and not args.metric
     rows = analysis.scored_rows(frame, task_type=args.task_type, pca_mean=args.pca_mean)
     other = frame[frame["task_type"] != args.task_type]
     cells = analysis.cell_summary(rows)
@@ -96,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
         "quantization_only_score": analysis.quantization_only(cells, "score"),
         "reduction_only": analysis.reduction_only(cells),
         "reduction_only_score": analysis.reduction_only(cells, "score"),
+        "all_cells": analysis.all_cells(cells),
+        "all_cells_score": analysis.all_cells(cells, "score"),
         "ror_gain": analysis.ror_gain(cells),
         "equal_count_gain": analysis.equal_count_gain(cells),
         "prefix_gap": analysis.prefix_gap(cells),
@@ -150,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
         figures = {
             "quantization_only": plots.quantization_only(tables["quantization_only"], tables["quantization_only_score"]),
             "reduction_only": plots.reduction_only(tables["reduction_only"], tables["reduction_only_score"]),
+            "all_cells": plots.all_cells(tables["all_cells"], tables["all_cells_score"]),
+            "all_cells_by_backbone": plots.all_cells_by_backbone(tables["all_cells"], tables["all_cells_score"]),
             "budget_frontier": plots.budget_frontier(cells, tables["budget_frontier"]),
             "budget_frontier_by_backbone": plots.budget_frontier_by_backbone(cells, tables["budget_frontier"]),
             "ror_gain": plots.ror_gain(tables["ror_gain"]),
@@ -159,8 +163,9 @@ def main(argv: list[str] | None = None) -> int:
             "prefix_gap": plots.prefix_gap(tables["prefix_gap"]),
             "task_deltas": plots.task_deltas(tables["task_deltas"], tables["task_scores"]["fp32"]),
             "task_deltas_by_backbone": plots.task_deltas_by_backbone(losses, list(TASK_DELTA_CELLS)),
-            "corpus_size_loss": plots.corpus_size_loss(losses, sizes, tables["corpus_size_correlation"]),
         }
+        if with_sizes:
+            figures["corpus_size_loss"] = plots.corpus_size_loss(losses, sizes, tables["corpus_size_correlation"])
         for name, figure in figures.items():
             plots.save(figure, out, name)
         print(f"\n{len(figures)} figures (png + pdf) -> {out}")
