@@ -168,7 +168,10 @@ def main(argv: list[str] | None = None) -> int:
             figures["corpus_size_loss"] = plots.corpus_size_loss(losses, sizes, tables["corpus_size_correlation"])
         for name, figure in figures.items():
             plots.save(figure, out, name)
-        print(f"\n{len(figures)} figures (png + pdf) -> {out}")
+        split = plots.all_cells_per_backbone(tables["all_cells"], tables["all_cells_score"])
+        for backbone, figure in split.items():
+            plots.save(figure, out / "all_cells_per_backbone", backbone)
+        print(f"\n{len(figures)} figures (png + pdf) -> {out}, {len(split)} more in all_cells_per_backbone/")
     print(f"{len(tables)} tables -> {out}")
     return 0
 

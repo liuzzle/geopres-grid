@@ -286,6 +286,7 @@ def test_every_figure_draws():
         plots.task_deltas_by_backbone(losses, list(selection)),
         plots.corpus_size_loss(losses, sizes, analysis.size_correlation(losses, sizes)),
     ]
+    figures += list(plots.all_cells_per_backbone(analysis.all_cells(cells), analysis.all_cells(cells, "score")).values())
     for figure in figures:
         assert figure.axes
         plots._pyplot().close(figure)

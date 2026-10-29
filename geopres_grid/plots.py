@@ -519,6 +519,30 @@ def all_cells_by_backbone(retention: pd.DataFrame, score: pd.DataFrame, ncols: i
     return figure
 
 
+def all_cells_per_backbone(retention: pd.DataFrame, score: pd.DataFrame) -> dict[str, Any]:
+    """`all_cells_by_backbone` split into one figure per backbone (one page each),
+    still on one colour scale so figures compare. Keyed by backbone."""
+    panels = {
+        backbone: _all_cells_panel(retention.loc[backbone], score.loc[backbone])
+        for backbone in retention.index.get_level_values("backbone").unique()
+    }
+    limit = _limit([loss for loss, _ in panels.values()])
+    figures = {}
+    for backbone, (loss, absolute) in panels.items():
+        figure = _heatmap(
+            loss,
+            title=f"{backbone}: every configuration, pts of retention vs fp32 (small: nDCG@10)",
+            xlabel="Quantizer",
+            ylabel="Reduction",
+            unit="pts of retention",
+            limit=limit,
+            scores=absolute,
+        )
+        _method_separators(figure.axes[:1], list(loss.index))
+        figures[backbone] = figure
+    return figures
+
+
 def prefix_gap(gap: pd.DataFrame):
     """Lines: truncation minus random selection (points) by dimension, one per backbone."""
     plt = _pyplot()
