@@ -130,6 +130,13 @@ class ExpansionConfig:
     `temperature` and `reasoning_effort` are sent only when set: reasoning models
     reject `temperature`, and a non-reasoning model rejects `reasoning`. Sampling is
     one completion per query (HyDE averages eight; that is eight times the cost).
+
+    `generation` repeats the same request as an independent sample: generation 1, 2,
+    ... get their own hash, file and tasks, so the spread of retrieval scores across
+    generations shows whether one generation is stable. It is in the hash only when
+    non-zero, so generation 0 keeps the hash it had before the field existed. The
+    request itself is identical; the samples differ only by the model's sampling
+    (none at temperature 0).
     """
 
     model: str
@@ -137,19 +144,22 @@ class ExpansionConfig:
     max_output_tokens: int = 512
     temperature: float | None = None
     reasoning_effort: str | None = None
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if self.variant not in VARIANTS:
             raise ValueError(f"unknown variant {self.variant!r}; known: {', '.join(VARIANTS)}")
         if self.max_output_tokens < 16:
             raise ValueError("max_output_tokens below 16 cannot hold an expansion")
+        if self.generation < 0:
+            raise ValueError("generation must be 0 or positive")
 
     @property
     def prompt(self) -> PromptTemplate:
         return VARIANTS[self.variant]
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model": self.model,
             "variant": self.variant,
             "prompt_version": self.prompt.version,
@@ -158,6 +168,9 @@ class ExpansionConfig:
             "temperature": self.temperature,
             "reasoning_effort": self.reasoning_effort,
         }
+        if self.generation:
+            payload["generation"] = self.generation
+        return payload
 
     @property
     def hash(self) -> str:
@@ -180,6 +193,7 @@ class ExpansionConfig:
             max_output_tokens=meta["max_output_tokens"],
             temperature=meta.get("temperature"),
             reasoning_effort=meta.get("reasoning_effort"),
+            generation=meta.get("generation", 0),
         )
         if config.prompt.sha != meta["prompt_sha"]:
             raise ValueError(

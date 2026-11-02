@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-output-tokens", type=int, help="Per call, reasoning included; default 512 (keywords 256)")
     parser.add_argument("--temperature", type=float, help="Sent only when given (reasoning models reject it)")
     parser.add_argument("--reasoning-effort", help="Sent only when given, e.g. minimal/low (reasoning models)")
+    parser.add_argument(
+        "--generation",
+        action="append",
+        type=int,
+        help="Independent sample index, repeatable (default 0); e.g. --generation 1 --generation 2 "
+        "for two more samples of the same variants, each its own expansion hash",
+    )
     parser.add_argument("--dry-run", action="store_true", help="No call: print token counts and the cost estimate")
     parser.add_argument("--stub", action="store_true", help="Use the offline stub expander, not the API")
     parser.add_argument("--price-input", type=float, help="USD per 1M input tokens")
@@ -86,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def expansion_config(args: argparse.Namespace, variant: str) -> ExpansionConfig:
+def expansion_config(args: argparse.Namespace, variant: str, generation: int = 0) -> ExpansionConfig:
     default_max = 256 if variant == "keywords" else 512
     return ExpansionConfig(
         # A stub answer must never sit under a real model's hash, whatever --out-root is.
@@ -95,6 +102,7 @@ def expansion_config(args: argparse.Namespace, variant: str) -> ExpansionConfig:
         max_output_tokens=args.max_output_tokens or default_max,
         temperature=args.temperature,
         reasoning_effort=args.reasoning_effort,
+        generation=generation,
     )
 
 
@@ -110,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit:
         queries = [q for q in queries if int(q.task_query_id[1:]) < args.limit]
     counter = TokenCounter()
-    configs = [expansion_config(args, variant) for variant in variants]
+    configs = [expansion_config(args, variant, g) for variant in variants for g in args.generation or [0]]
 
     if args.dry_run:
         totals = {"calls": 0, "input_tokens": 0, "expected_output_tokens": 0, "worst_output_tokens": 0}

@@ -306,3 +306,14 @@ def test_search_kernels_rank_the_corpus():
     rows = search_latency([64], ["none", "binary"], [100], repeats=3)
     assert [row["kernel"] for row in rows] == ["float32 matvec (dequantized)", "xor+popcount"]
     assert rows[1]["index_bytes"] == 100 * 64 // 8
+
+
+def test_generation_zero_keeps_the_hash_and_others_get_their_own():
+    first = config()
+    assert first.hash == ExpansionConfig(model="gpt-test", variant="pseudodoc", generation=0).hash
+    assert "generation" not in first.payload()
+    second, third = config(generation=1), config(generation=2)
+    assert len({first.hash, second.hash, third.hash}) == 3
+    assert ExpansionConfig.from_meta(third.to_meta()) == third
+    with pytest.raises(ValueError, match="generation"):
+        config(generation=-1)
