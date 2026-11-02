@@ -35,6 +35,9 @@ flash-attn = ["flash-attn>=2.5.0"]
 # Figures for scripts/analyse_results.py and scripts/check_pca_centring.py. Only the
 # analysis needs it; grid and precompute jobs run without.
 analysis = ["matplotlib"]
+# LLM query expansion of the Impresso queries (scripts/expand_queries.py). Only the
+# expansion call needs it; precompute and evaluation read the stored expansions.
+expansion = ["openai>=3.41.0", "tiktoken>=0.14.0"]
 
 [dependency-groups]
 dev = ["pytest"]

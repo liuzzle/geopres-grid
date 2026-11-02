@@ -18,9 +18,10 @@ from datetime import datetime
 from sentence_transformers import SentenceTransformer
 
 from geopres_grid.backbones import PRIMARY_MAX_SEQ_LENGTH, get, require_runnable
-from geopres_grid.cache import CORPUS_COPIES, CachedBackbone
+from geopres_grid.cache import CachedBackbone
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH, resolve_device
-from geopres_grid.evaluation import TIER_TASKS, baseline_pass, load_tasks, task_names
+from geopres_grid.evaluation import TIER_TASKS, baseline_pass, load_tasks, task_names, with_query_expansions
+from geopres_grid.expansion import COMBINE_MODES
 from geopres_grid.identity import EncodeConfig
 from geopres_grid.precompute import DEFAULT_CHUNK_SIZE, leaf_tasks, precompute_task_cache
 
@@ -44,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tier", choices=sorted(TIER_TASKS), help="Precompute a whole tier or task set")
     parser.add_argument("--split", action="append", help="Override the task's eval splits")
     parser.add_argument("--subset", action="append", help="Override the task's subsets")
+    parser.add_argument(
+        "--query-expansion",
+        action="append",
+        metavar="HASH",
+        help="Replace each Impresso task by its variants with this query expansion (expand_queries.py); "
+        "their documents are copied from the original task, only queries are encoded. Repeatable",
+    )
+    parser.add_argument(
+        "--combine", action="append", choices=COMBINE_MODES, help="With --query-expansion; default both"
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--chunk-size",
@@ -97,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
 
     results_cache = mteb.ResultCache(args.results_root)
     names = list(args.task or task_names(args.tier))
+    if args.query_expansion:
+        names = list(with_query_expansions(names, args.query_expansion, args.combine or COMBINE_MODES))
     for named in load_tasks(names):
         if not all(isinstance(leaf, AbsTaskRetrieval) for leaf in leaf_tasks(named)):
             if args.split or args.subset:
@@ -130,10 +143,10 @@ def main(argv: list[str] | None = None) -> int:
                 progress=lambda line: print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}", flush=True),
             )
             for block in summary["copied_blocks"]:
-                print(f"Copied and verified {block} from {CORPUS_COPIES[summary['task']]}")
-            if summary["task"] in CORPUS_COPIES and not summary["copied_blocks"]:
+                print(f"Copied and verified {block} from {summary['corpus_source']}")
+            if summary["corpus_source"] and not summary["copied_blocks"]:
                 print(
-                    f"Nothing copied from {CORPUS_COPIES[summary['task']]}: its blocks were not "
+                    f"Nothing copied from {summary['corpus_source']}: its blocks were not "
                     f"finished, or {summary['task']} already had its own"
                 )
             print(

@@ -2,7 +2,8 @@
 # Submit one backbone's grid: a baselines job, then an array of shards that starts
 # only once the baselines succeeded, so no two shards write the same result.
 #
-#   scripts/slurm/submit_grid.sh <backbone> [tier] [shards]     # tier1, 1 shard
+#   scripts/slurm/submit_grid.sh <backbone> [tier] [shards] [run_grid.py options]   # tier1, 1 shard
+#   scripts/slurm/submit_grid.sh mgte impresso 1 --query-expansion <hash>   # expanded Impresso tasks
 #
 # Tier 1 takes minutes per backbone in one job; shards are for tier 2.
 # Memory: grid.sh's 16G for tier 1, 64G for tier 2, where one task's cache index
@@ -26,8 +27,8 @@ mem=${GRID_MEM:-$default_mem}
 
 mkdir -p logs
 baselines=$(sbatch --parsable --mem="$mem" --job-name="grid-$backbone-baselines" --output="logs/%x_%j.out" \
-    scripts/slurm/grid.sh --backbone "$backbone" --tier "$tier" --baselines-only)
+    scripts/slurm/grid.sh --backbone "$backbone" --tier "$tier" --baselines-only "${@:4}")
 cells=$(sbatch --parsable --mem="$mem" --job-name="grid-$backbone" --dependency="afterok:$baselines" \
     --array="0-$((shards - 1))" \
-    scripts/slurm/grid.sh --backbone "$backbone" --tier "$tier" --num-shards "$shards")
+    scripts/slurm/grid.sh --backbone "$backbone" --tier "$tier" --num-shards "$shards" "${@:4}")
 echo "$backbone/$tier: baselines job $baselines, cells array $cells (${shards} shards, $mem each)"

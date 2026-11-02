@@ -5,6 +5,7 @@
 #
 # The tier defaults to tier1; anything after it goes to scripts/precompute.py, e.g.
 #   sbatch scripts/slurm/precompute.sh harrier-06b mldr --subset de --batch-size 16
+#   sbatch scripts/slurm/precompute.sh mgte impresso --query-expansion <hash>   # expanded queries only
 # (`--batch-size` is recorded, not hashed: a smaller one keeps the encode hash.)
 #
 # Submit from the repo root; `.env` there sets PROJECT_ROOT and STORAGE_PATH.

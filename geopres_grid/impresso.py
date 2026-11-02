@@ -13,6 +13,15 @@ cache is keyed by task name; ~1.5k documents, minutes on a GPU.
 The data is read from `config.IMPRESSO_PATH`, in the layout it was sent in. The task
 classes need `mteb`, so this module is imported lazily (`evaluation.load_tasks`);
 `evaluation.IMPRESSO_TASKS` carries the names.
+
+`expanded_task` builds a variant of one of the four whose queries are LLM
+expansions (`geopres_grid.expansion`, logging.md §71). Its documents are the
+original task's, byte for byte: `corpus_source` makes precompute copy the original's
+finished document block (`cache.copy_document_blocks`), so only the queries are
+encoded. Its name carries the expansion hash and the combine mode, which gives it
+its own cache directory and its own MTEB result file under the same encode hash and
+run ids as the original -- the backbone and the post-processing are unchanged; the
+inputs are not.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from mteb.abstasks import AbsTaskRetrieval
 from mteb.abstasks.task_metadata import TaskMetadata
 
 from geopres_grid import config
+from geopres_grid.expansion import combine, load_config, load_expansions, parse_expanded_task_name, usable
 
 SPLIT = "test"
 SUBSET = "default"
@@ -83,8 +93,50 @@ class ImpressoRetrieval(AbsTaskRetrieval):
                 f"Impresso data not found at {folder}. Copy Impresso_IR_test_set_eval_eval_format "
                 f"to {config.IMPRESSO_PATH} (or set IMPRESSO_PATH)."
             )
-        self.dataset = {SUBSET: {SPLIT: load_split(folder)}}
+        self.dataset = {SUBSET: {SPLIT: self.split_data(folder)}}
         self.data_loaded = True
+
+    def split_data(self, folder: Path) -> dict[str, Any]:
+        return load_split(folder)
+
+
+class ExpandedImpressoRetrieval(ImpressoRetrieval):
+    """An Impresso task whose query texts are replaced by `combine(query, expansion)`.
+
+    Query ids, qrels and the corpus are the original task's. Every query must have a
+    usable expansion whose recorded query text is the current one; anything else is
+    an error, never a silent fallback to the bare query.
+    """
+
+    expansion_hash: str
+    combine_mode: str
+    corpus_source: str
+    """The original task, whose finished document block precompute copies."""
+
+    def split_data(self, folder: Path) -> dict[str, Any]:
+        split = load_split(folder)
+        expansions = load_expansions(config.QUERY_EXPANSION_PATH, self.expansion_hash)
+        rows, missing = [], []
+        for row in split["queries"]:
+            key = f"{self.form}/{self.language}/{row['id']}"
+            record = expansions.get(key)
+            if record is None or not usable(record):
+                missing.append(key)
+                continue
+            if record["query"] != row["text"]:
+                raise ValueError(
+                    f"{self.metadata.name}: expansion {self.expansion_hash} was made for another text of "
+                    f"{key} ({record['query']!r}, now {row['text']!r}); the data set changed"
+                )
+            rows.append({"id": row["id"], "text": combine(row["text"], record["expansion"], self.combine_mode)})
+        if missing:
+            raise ValueError(
+                f"{self.metadata.name}: {len(missing)} of {len(split['queries'])} queries have no usable "
+                f"expansion in {self.expansion_hash}, e.g. {missing[:3]}; finish scripts/expand_queries.py "
+                "(--retry-unusable for empty or truncated answers)"
+            )
+        split["queries"] = Dataset.from_list(rows)
+        return split
 
 
 def _metadata(form: str, language: str) -> TaskMetadata:
@@ -119,3 +171,40 @@ def _task(form: str, language: str) -> type[ImpressoRetrieval]:
 TASKS: dict[str, type[ImpressoRetrieval]] = {
     cls.metadata.name: cls for cls in (_task(form, language) for language in LANGUAGES for form in QUERY_FORMS)
 }
+
+
+def expanded_task(name: str) -> type[ExpandedImpressoRetrieval]:
+    """The task class behind an expanded name (`expansion.expanded_task_name`).
+
+    Reads the expansion's `config.json` from `config.QUERY_EXPANSION_PATH`, so a
+    missing or renamed expansion fails when the task is built, not mid-run.
+    """
+    parts = parse_expanded_task_name(name)
+    if parts is None or parts["base"] not in TASKS:
+        raise KeyError(f"{name!r} is not an expanded Impresso task name")
+    expansion = load_config(config.QUERY_EXPANSION_PATH, parts["hash"])
+    if expansion.variant != parts["variant"]:
+        raise ValueError(f"{name}: expansion {parts['hash']} is variant {expansion.variant!r}, not {parts['variant']!r}")
+    base = TASKS[parts["base"]]
+    metadata = base.metadata.model_copy(
+        update={
+            "name": name,
+            "description": (
+                f"{base.metadata.description} Queries: {parts['combine']} with the {expansion.variant} "
+                f"expansion by {expansion.model} (expansion {parts['hash']})."
+            ),
+            "dataset": {**base.metadata.dataset, "revision": f"{DATA_REVISION}+qe-{parts['hash']}-{parts['combine']}"},
+        }
+    )
+    return type(
+        name,
+        (ExpandedImpressoRetrieval,),
+        {
+            "metadata": metadata,
+            "form": base.form,
+            "language": base.language,
+            "expansion_hash": parts["hash"],
+            "combine_mode": parts["combine"],
+            "corpus_source": parts["base"],
+        },
+    )

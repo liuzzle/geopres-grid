@@ -90,6 +90,11 @@ IMPRESSO_PATH = os.getenv("IMPRESSO_PATH", os.path.join(STORAGE_PATH, "impresso"
 """The Impresso IR test set as Andrianos sent it (`crosslingual/DE/docs.csv`, ...).
 Not public, so it is never in the repo; copy the folder here on every machine."""
 
+QUERY_EXPANSION_PATH = os.getenv("QUERY_EXPANSION_PATH", os.path.join(STORAGE_PATH, "query_expansions"))
+"""LLM query expansions of the Impresso queries, one directory per expansion hash
+(`geopres_grid.expansion`). Small (a few MB); copy them to every machine that
+precomputes or evaluates an expanded Impresso task."""
+
 TRAINED_MODELS_PATH = os.getenv(
     "TRAINED_MODELS_PATH", os.path.join(STORAGE_PATH, "trained_models")
 )

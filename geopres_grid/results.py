@@ -121,9 +121,12 @@ def _config_columns(record: dict[str, Any]) -> dict[str, Any]:
 def add_task_metadata(frame: pd.DataFrame) -> pd.DataFrame:
     """Task type and main-score name from the pinned mteb, for tasks it knows.
 
-    The custom Impresso tasks are not in mteb's registry; their metadata is ours.
+    The custom Impresso tasks are not in mteb's registry; their metadata is ours,
+    and a query-expanded variant has its original's.
     """
     import mteb
+
+    from geopres_grid.expansion import parse_expanded_task_name
 
     from geopres_grid.impresso import TASKS as impresso_tasks
 
@@ -131,6 +134,10 @@ def add_task_metadata(frame: pd.DataFrame) -> pd.DataFrame:
         name: (task.metadata.type, task.metadata.main_score) for name, task in impresso_tasks.items()
     }
     for name in sorted(set(frame["task"]) - set(known)):
+        expanded = parse_expanded_task_name(name)
+        if expanded and expanded["base"] in known:
+            known[name] = known[expanded["base"]]
+            continue
         try:
             metadata = mteb.get_tasks(tasks=[name])[0].metadata
         except (KeyError, IndexError, ValueError):

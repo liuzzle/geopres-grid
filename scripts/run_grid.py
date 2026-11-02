@@ -28,7 +28,16 @@ import mteb
 from geopres_grid.backbones import PRIMARY_MAX_SEQ_LENGTH, get
 from geopres_grid.cache import CachedBackbone, resolve_encode_config
 from geopres_grid.config import EMBEDDING_CACHE_PATH, EVALUATION_RESULTS_PATH
-from geopres_grid.evaluation import TIER_TASKS, PostProcessedBackbone, baseline_pass, evaluate_cell, load_tasks, task_names
+from geopres_grid.evaluation import (
+    TIER_TASKS,
+    PostProcessedBackbone,
+    baseline_pass,
+    evaluate_cell,
+    load_tasks,
+    task_names,
+    with_query_expansions,
+)
+from geopres_grid.expansion import COMBINE_MODES
 from geopres_grid.grid import GRID_DR_METHODS, GRID_QUANT_METHODS, GRID_TARGET_DIMS, grid_cells, shard
 from geopres_grid.identity import BITS_PER_DIM, DEFAULT_DR_SEED, DR_METHODS, PCA_MEAN_MODES, SEEDED_DR_METHODS
 from geopres_grid.precompute import leaf_tasks
@@ -39,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone", required=True)
     parser.add_argument("--tier", choices=sorted(TIER_TASKS), default="tier1")
     parser.add_argument("--task", action="append", help="Restrict to these tasks; repeatable")
+    parser.add_argument(
+        "--query-expansion",
+        action="append",
+        metavar="HASH",
+        help="Score the Impresso tasks' variants with this query expansion instead of the originals; repeatable",
+    )
+    parser.add_argument("--combine", action="append", choices=COMBINE_MODES, help="With --query-expansion; default both")
     parser.add_argument("--baselines-only", action="store_true", help="Score the fp32 baselines and stop")
     parser.add_argument("--list", action="store_true", help="Print this shard's cells and stop")
     parser.add_argument("--dr-method", action="append", choices=DR_METHODS, help=f"Restrict; default {GRID_DR_METHODS}")
@@ -93,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
     cached = CachedBackbone(None, backbone, encode_config, Path(args.cache_root))
     results_cache = mteb.ResultCache(args.results_root)
     names = tuple(args.task) if args.task else task_names(args.tier)
+    if args.query_expansion:
+        names = with_query_expansions(names, args.query_expansion, args.combine or COMBINE_MODES)
     print(
         f"{backbone.key} (encode {encode_config.hash}), {len(names)} tasks, "
         + ("baselines only" if args.baselines_only else f"{len(cells)} cells, shard {args.shard}/{args.num_shards}"),

@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 import mteb
 import numpy as np
@@ -14,7 +15,9 @@ from geopres_grid.evaluation import (
     evaluate_cell,
     load_tasks,
     task_names,
+    with_query_expansions,
 )
+from geopres_grid.expansion import ExpansionConfig, expanded_task_name
 from geopres_grid.identity import EncodeConfig, PostProcConfig
 from geopres_grid.impresso import TASKS, load_split
 from geopres_grid.precompute import precompute_task_cache
@@ -147,3 +150,111 @@ def test_results_know_the_impresso_task_type():
     assert frame["task_type"].tolist()[0] == "Retrieval"
     assert frame["main_score_name"].tolist()[0] == "ndcg_at_10"
     assert frame["task_type"].isna().tolist()[1]
+
+
+# --- query-expanded variants ---------------------------------------------------------
+
+
+@pytest.fixture
+def expansion(impresso_dir, tmp_path, monkeypatch):
+    """Keyword expansions of every query by the stub: the query word and "story"."""
+    from geopres_grid.expansion import Budget, ExpansionConfig, StubExpander, read_queries, run_expansion
+
+    root = tmp_path / "query_expansions"
+    monkeypatch.setattr(config, "QUERY_EXPANSION_PATH", str(root))
+    expansion = ExpansionConfig("gpt-test", "keywords")
+    summary = run_expansion(
+        expansion,
+        read_queries(impresso_dir),
+        StubExpander(lambda instructions, text: f"{text.split(': ', 1)[1]} story"),
+        root,
+        Budget(max_calls=100, max_tokens=10**6),
+        requests_per_minute=0,
+    )
+    assert summary["usable"] == 40
+    return expansion
+
+
+def test_query_ids_match_the_task_ids(impresso_dir):
+    from geopres_grid.expansion import read_queries
+
+    queries = [q for q in read_queries(impresso_dir) if q.query_id.startswith("crosslingual/FR/")]
+    split = load_split(impresso_dir / "crosslingual" / "FR")
+
+    assert [(q.task_query_id, q.text) for q in queries] == [(row["id"], row["text"]) for row in split["queries"]]
+
+
+def test_expanded_tasks_are_named_per_expansion_and_mode(expansion):
+    names = with_query_expansions(["ImpressoMultilingualDE", "NFCorpus"], [expansion.hash])
+
+    assert names == (
+        f"ImpressoMultilingualDE__qe-keywords-{expansion.hash}-replace",
+        f"ImpressoMultilingualDE__qe-keywords-{expansion.hash}-concat",
+        "NFCorpus",
+    )
+    replace, concat = load_tasks(names[:2])
+    replace.load_data()
+    concat.load_data()
+    texts = lambda task: {row["id"]: row["text"] for row in task.dataset["default"]["test"]["queries"]}
+    assert texts(replace)["q3"] == "delta story"
+    assert texts(concat)["q3"] == "delta\ndelta story"
+    assert replace.dataset["default"]["test"]["relevant_docs"] == load_split(
+        Path(config.IMPRESSO_PATH) / "multilingual" / "DE"
+    )["relevant_docs"]
+    assert replace.corpus_source == "ImpressoMultilingualDE"
+    assert replace.metadata.eval_langs == TASKS["ImpressoMultilingualDE"].metadata.eval_langs
+
+
+def test_an_expanded_task_needs_every_expansion_for_the_current_text(expansion, impresso_dir):
+    (task,) = load_tasks([expanded_task_name("ImpressoCrosslingualDE", expansion, "concat")])
+    write_csv(
+        impresso_dir / "crosslingual" / "DE" / "queries.csv",
+        [{"search_query": "changed", "idx": "0"}],
+    )
+    with pytest.raises(ValueError, match="another text"):
+        task.load_data()
+
+    other = ExpansionConfig("gpt-test", "pseudodoc")
+    with pytest.raises(FileNotFoundError, match="expand_queries"):
+        load_tasks([expanded_task_name("ImpressoCrosslingualDE", other, "concat")])
+
+
+def test_an_expanded_task_copies_the_documents_and_encodes_only_queries(expansion, tmp_path):
+    cache_root = tmp_path / "cache"
+    backbone, encode_config = get("mdenseon"), make_encode_config()
+    precompute = lambda task: precompute_task_cache(
+        model=LetterModel(), backbone=backbone, encode_config=encode_config, task=task, cache_root=cache_root
+    )
+    (original,) = load_tasks(["ImpressoMultilingualDE"])
+    original.load_data()
+    precompute(original)
+
+    names = with_query_expansions(["ImpressoMultilingualDE"], [expansion.hash])
+    cached = CachedBackbone(None, backbone, encode_config, cache_root)
+    results = mteb.ResultCache(tmp_path / "results")
+    cell = PostProcConfig(dr_method="pca", target_dim=8, quant_method="int8")
+    for task in load_tasks(names):
+        task.load_data()
+        summary = precompute(task)
+        assert summary["corpus_source"] == "ImpressoMultilingualDE" and len(summary["copied_blocks"]) == 1
+        assert summary["newly_encoded"] == 10  # the queries; all ten documents came with the copy
+        baseline, scored = evaluate_cell(PostProcessedBackbone(cached, cell), task, results_cache=results)
+        assert baseline.task_results[0].get_score() > 0.5
+
+    assert cached.newly_encoded == 0
+    stored = sorted(path.stem for path in (tmp_path / "results").rglob("Impresso*.json"))
+    # A baseline and a cell slot for each of the two variants, none overwriting another.
+    assert stored == sorted(names * 2)
+    run_dirs = {path.parent for path in (tmp_path / "results").rglob("Impresso*.json")}
+    assert len(run_dirs) == 2
+
+
+def test_results_give_an_expanded_task_its_originals_type(expansion):
+    import pandas as pd
+
+    from geopres_grid.results import add_task_metadata
+
+    name = expanded_task_name("ImpressoCrosslingualFR", expansion, "replace")
+    frame = add_task_metadata(pd.DataFrame({"task": [name]}))
+
+    assert frame["task_type"].tolist() == ["Retrieval"] and frame["main_score_name"].tolist() == ["ndcg_at_10"]

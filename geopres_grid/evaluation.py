@@ -18,6 +18,7 @@ from typing import Any, Literal
 import numpy as np
 
 from geopres_grid.cache import CachedBackbone, committed_embeddings, run_model_meta, side_of
+from geopres_grid.expansion import COMBINE_MODES, expanded_task_name, load_config, parse_expanded_task_name
 from geopres_grid.identity import PostProcConfig, RunId
 from geopres_grid.precompute import leaf_tasks
 from geopres_grid.quantizers import Quantizer, fake_quantize, fit_quantizer
@@ -99,7 +100,8 @@ IMPRESSO_TASKS: tuple[str, ...] = (
     "ImpressoMultilingualFR",
 )
 """Andrianos' Impresso IR test set (logging.md §25, §36), custom tasks defined in
-`geopres_grid.impresso` and not known to `mteb.get_task`; `load_tasks` builds them.
+`geopres_grid.impresso` and not known to `mteb.get_task`; `load_tasks` builds them,
+and their query-expanded variants (`with_query_expansions`), which are in no tier.
 Kept apart from `impresso.TASKS` so this module stays importable without `mteb`."""
 
 TIER_TASKS: dict[Tier, tuple[str, ...]] = {
@@ -245,14 +247,35 @@ def load_tasks(names: Any) -> list[Any]:
 
     use_cached_dataset_configs()
     use_fast_classification_labels()
-    if any(name in IMPRESSO_TASKS for name in names):
+    if any(name in IMPRESSO_TASKS or parse_expanded_task_name(name) for name in names):
         from geopres_grid.impresso import TASKS as impresso_tasks
+        from geopres_grid.impresso import expanded_task
     return [
         impresso_tasks[name]()
         if name in IMPRESSO_TASKS
+        else expanded_task(name)()
+        if parse_expanded_task_name(name)
         else mteb.get_task(name, eval_splits=list(TASK_EVAL_SPLITS[name]) if name in TASK_EVAL_SPLITS else None)
         for name in names
     ]
+
+
+def with_query_expansions(
+    names: Any, expansion_hashes: Any, combine_modes: Any = COMBINE_MODES
+) -> tuple[str, ...]:
+    """`names` with every Impresso task replaced by its expanded variants
+    (`impresso.expanded_task`), one per expansion hash and combine mode; other tasks
+    are kept. Reads each expansion's `config.json` for its variant name."""
+    from geopres_grid import config as project_config
+
+    expansions = [load_config(project_config.QUERY_EXPANSION_PATH, value) for value in expansion_hashes]
+    expanded: list[str] = []
+    for name in names:
+        if name not in IMPRESSO_TASKS:
+            expanded.append(name)
+            continue
+        expanded += [expanded_task_name(name, expansion, mode) for expansion in expansions for mode in combine_modes]
+    return tuple(expanded)
 
 
 # --- calibration ---------------------------------------------------------------

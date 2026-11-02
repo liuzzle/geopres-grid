@@ -46,6 +46,12 @@ def leaf_tasks(task: Any) -> list[Any]:
     return [task]
 
 
+def corpus_source(task: Any) -> str | None:
+    """The task whose finished document blocks `task` starts from: `cache.CORPUS_COPIES`,
+    or the task's own `corpus_source` (`impresso.ExpandedImpressoRetrieval`)."""
+    return getattr(task, "corpus_source", None) or CORPUS_COPIES.get(task.metadata.name)
+
+
 def precompute_task_cache(
     *,
     model: Any,
@@ -63,9 +69,10 @@ def precompute_task_cache(
 
     Defaults to every evaluation split and subset the task declares; NanoBEIR's
     only split is `train`, MSMARCO's is `dev`, so no single default name is right.
-    A task in `cache.CORPUS_COPIES` (ClimateFEVER) first copies its source's
-    finished document blocks, so only the passages the source lacks are encoded;
-    without a finished source it encodes everything, which is slower, not wrong.
+    A task with a `corpus_source` (ClimateFEVER, a query-expanded Impresso task)
+    first copies its source's finished document blocks, so only the passages the
+    source lacks are encoded -- for an expanded Impresso task, none; without a
+    finished source it encodes everything, which is slower, not wrong.
 
     Each side is cached `chunk_size` rows at a time, and each chunk is committed
     before the next is read, so memory does not grow with the corpus (beyond the
@@ -83,10 +90,11 @@ def precompute_task_cache(
 
     wrapper = CachedBackbone(model, backbone, encode_config, cache_root)
     copied: list[Path] = []
-    if task.metadata.name in CORPUS_COPIES:
+    source = corpus_source(task)
+    if source is not None:
         copied = copy_document_blocks(
             wrapper.encode_directory,
-            CORPUS_COPIES[task.metadata.name],
+            source,
             task.metadata.name,
             splits=splits,
             subsets=subsets,
@@ -144,5 +152,6 @@ def precompute_task_cache(
         "queries": queries,
         "cache_root": str(Path(cache_root)),
         "newly_encoded": wrapper.newly_encoded,
+        "corpus_source": source,
         "copied_blocks": [str(path) for path in copied],
     }
