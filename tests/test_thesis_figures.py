@@ -73,3 +73,9 @@ def test_best_per_budget_takes_the_highest_score_at_or_under_the_budget():
     best = best_per_budget(table).set_index("budget")
     assert best.loc[8, "configuration"] == "PCA-64 / binary"
     assert best.loc[16, "configuration"] == "PCA-64 / EC-2" and best.loc[256, "configuration"] == "PCA-64 / EC-2"
+
+
+def test_points_never_print_negative_zero():
+    from thesis_figures import pp
+
+    assert pp(-0.003) == "+0.0" and pp(-0.06) == "-0.1" and pp(2.0) == "+2.0"

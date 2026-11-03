@@ -49,8 +49,10 @@ FILES = {
     "beir": "beir_results.csv",
     "impresso": "impresso_collect_results.csv",
     "seeds": "seed_check_results.csv",
+    "expanded": "impresso_expanded_results.csv",
 }
 FILTERS = {
+    "expanded": "Impresso rows only (3,780 original + 840 expanded, pseudo-document, concat, generation 0); paired on backbone, run_id, base task",
     "nanobeir": "task_type Retrieval; pca_mean in {restore, empty}",
     "beir": "task_type Retrieval (all rows; PCA cells are restore)",
     "impresso": "task starts with Impresso (3,780 rows)",
@@ -235,8 +237,9 @@ def percent(value: float) -> str:
 
 
 def pp(value: float) -> str:
-    """Points, with a sign; `value` is already in points."""
-    return f"{value:+.1f}"
+    """Points, with a sign; `value` is already in points. A value that rounds to zero
+    prints as +0.0, never -0.0."""
+    return f"{round(value, 1) + 0.0:+.1f}"
 
 
 def rho(value: float) -> str:
@@ -253,11 +256,11 @@ def integer(value: float) -> str:
 
 
 def pm(mean: float, std: float) -> str:
-    return f"{mean:+.1f} $\\pm$ {std:.1f}"
+    return f"{pp(mean)} $\\pm$ {std:.1f}"
 
 
 def span(mean: float, low: float, high: float) -> str:
-    return f"{mean:+.1f} ({low:+.1f} to {high:+.1f})"
+    return f"{pp(mean)} ({pp(low)} to {pp(high)})"
 
 
 def tex(text: str) -> str:
@@ -840,6 +843,71 @@ def table_impresso(output: Output, impresso: pd.DataFrame, impresso_r5: pd.DataF
     output.table("T11", latex, data)
 
 
+def table_expansion(output: Output, ledger: Ledger, frozen: Frozen) -> None:
+    """K1 (appendix): LLM query expansion on Impresso, expanded minus original queries.
+
+    Per reference configuration and backbone, the nDCG@10 difference in pp (mean over
+    the four tasks), then retention under each query form against its own fp32
+    baseline (mean over backbones and tasks), and `recovered`: the expanded compressed
+    score minus the original fp32 score (>= 0 would mean expansion makes up the whole
+    compression loss). Pairing as in `scripts/analyse_expansion.py`.
+    """
+    from analyse_expansion import paired_cells
+
+    pairs = paired_cells(frozen.frame("expanded"), "main_score")
+    names = {name.replace(" / ", "/"): name for name in ["Full / fp32", *REFERENCE]}
+    pairs = pairs[pairs["config"].isin(names)].assign(config=lambda f: f["config"].map(names))
+    per_backbone = pairs.groupby(["config", "backbone"])["delta"].mean().unstack("backbone") * 100
+    summary = pairs.groupby("config").agg(
+        delta=("delta", "mean"),
+        original_retention=("original_retention", "mean"),
+        expanded_retention=("expanded_retention", "mean"),
+        recovered=("recovered", "mean"),
+    )
+    order = [name for name in names.values() if name in per_backbone.index]
+    backbones = [b for b in BACKBONES if b in per_backbone.columns]
+    rows = []
+    for config in order:
+        line = [config] + [pp(per_backbone.loc[config, b]) for b in backbones] + [pp(summary.loc[config, "delta"] * 100)]
+        if config == "Full / fp32":
+            line += ["100.0", "100.0", "--"]
+        else:
+            line += [
+                percent(summary.loc[config, "original_retention"]),
+                percent(summary.loc[config, "expanded_retention"]),
+                pp(summary.loc[config, "recovered"] * 100),
+            ]
+        rows.append(line)
+    latex = latex_table(
+        ["Configuration"] + [BACKBONES[b] for b in backbones] + ["Mean", "Original", "Expanded", "Recovered"],
+        rows,
+        "l" + "r" * (len(backbones) + 4),
+        groups=[("", 1), ("$\\Delta$ nDCG@10, expanded $-$ original (pp)", len(backbones) + 1), ("Retention (\\%)", 2), ("", 1)],
+        midrule_before=[1],
+        notes=[
+            "K1: Impresso with LLM query expansion (one pseudo-document per query, concatenated to it; one generation). Mean over the four tasks; Mean/Retention/Recovered also over backbones.",
+            "Recovered: expanded compressed score minus original fp32 score (pp); >= 0 would mean the whole compression loss is made up. Retention: each query form against its own fp32 baseline.",
+        ],
+    )
+    data = per_backbone.loc[order].join(summary.loc[order])
+    output.table("K1", latex, data)
+    fp32 = pairs[pairs["config"] == "Full / fp32"]
+    output.table(
+        "K1_fp32_tasks",
+        "% K1 companion: fp32 delta per backbone and task (CSV only)\n",
+        fp32.pivot_table(index="backbone", columns="base", values="delta") * 100,
+    )
+    source, filter_ = FILES["expanded"], FILTERS["expanded"]
+    ledger.add(("expansion", "fp32", "delta", "mean"), pp(summary.loc["Full / fp32", "delta"] * 100), source, filter_, "expanded minus original fp32 nDCG@10, mean over backbones and tasks; x100")
+    for backbone in backbones:
+        ledger.add(("expansion", "fp32", "delta", BACKBONE_MACRO[backbone]), pp(per_backbone.loc["Full / fp32", backbone]), source, filter_, "expanded minus original fp32 nDCG@10, mean over the four tasks; x100")
+    compressed = summary.drop(index=["Full / fp32", "Full / fp16"], errors="ignore")
+    ledger.add(("expansion", "recovered", "max"), pp(compressed["recovered"].max() * 100), source, filter_, "max over compressed reference configurations (fp16 excluded) of mean(expanded score - original fp32); x100")
+    for config in ("Full / binary", "Truncation-128 / fp32"):
+        for side in ("original", "expanded"):
+            ledger.add(("expansion", "retention", config, side), percent(summary.loc[config, f"{side}_retention"]), source, filter_, f"{side} queries: cell / own fp32, mean over backbones and tasks; x100")
+
+
 # --- Figures -------------------------------------------------------------------------
 
 
@@ -1119,6 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
     scale = analysis.scale_cost(paired)
     table_scale_cost(output, ledger, scale, transfer, paired)
     table_impresso(output, rows["impresso"], impresso_r5)
+    table_expansion(output, ledger, frozen)
 
     losses = pd.concat(
         [analysis.task_losses(small, REFERENCE).assign(tier="nanobeir"), analysis.task_losses(large, REFERENCE).assign(tier="beir")],
