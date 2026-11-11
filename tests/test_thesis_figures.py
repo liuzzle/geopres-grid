@@ -79,3 +79,66 @@ def test_points_never_print_negative_zero():
     from thesis_figures import pp
 
     assert pp(-0.003) == "+0.0" and pp(-0.06) == "-0.1" and pp(2.0) == "+2.0"
+
+
+def test_pca_mean_gain_is_restored_minus_subtracted_for_cells_scored_both_ways():
+    from thesis_figures import pca_mean_gain
+
+    base = {"backbone": "b", "target_dim": 64, "quant_method": "none"}
+    restored = pd.DataFrame([{**base, "dr_method": "pca", "retention": 0.90}, {**base, "dr_method": "truncate", "retention": 0.70},
+                             {**base, "dr_method": "pca_ror", "quant_method": "binary", "retention": 0.60}])
+    subtracted = pd.DataFrame([{**base, "dr_method": "pca", "retention": 0.85}, {**base, "dr_method": "truncate", "retention": 0.70}])
+    gain = pca_mean_gain(restored, subtracted)
+    assert len(gain) == 1 and gain.loc[0, "dr_method"] == "pca" and np.isclose(gain.loc[0, "gain"], 5.0)
+
+
+def nonretrieval_rows():
+    """Classification task A has two subsets, B one; STS one task. Raw baselines are
+    unnormalized (fp16 scores above them), as for mDenseOn."""
+    rows = []
+
+    def add(task_type, task, subset, baseline, fp16, binary):
+        common = {"backbone": "b", "task_type": task_type, "task": task, "split": "test", "subset": subset, "dr_seed": np.nan, "pca_mean": np.nan}
+        rows.append({**common, "kind": "baseline", "dr_method": "none", "target_dim": np.nan, "quant_method": "none", "bytes_per_vector": 4096, "main_score": baseline})
+        rows.append({**common, "kind": "cell", "dr_method": "none", "target_dim": np.nan, "quant_method": "fp16", "bytes_per_vector": 2048, "main_score": fp16})
+        rows.append({**common, "kind": "cell", "dr_method": "none", "target_dim": np.nan, "quant_method": "binary", "bytes_per_vector": 128, "main_score": binary})
+
+    add("Classification", "A", "en", 0.80, 0.81, 0.81 * 0.9)
+    add("Classification", "A", "de", 0.60, 0.61, 0.61 * 0.9)
+    add("Classification", "B", "default", 0.50, 0.50, 0.50 * 0.7)
+    add("Clustering", "C", "default", 0.40, 0.40, 0.36)
+    add("STS", "S", "default", 0.80, 0.80, 0.78)
+    return pd.DataFrame(rows)
+
+
+def test_task_types_average_subsets_first_and_take_classification_against_fp16():
+    from thesis_figures import task_type_cells
+
+    cells = task_type_cells(nonretrieval_rows()).set_index(["task_type", "quant_method"])
+    binary = cells.loc[("Classification", "binary")]
+    assert np.isclose(binary["retention"], 0.8)  # mean over tasks (0.9, 0.7), not over three rows
+    assert np.isclose(cells.loc[("Classification", "fp16"), "retention"], 1.0)
+    raw = np.mean([np.mean([0.81 / 0.80, 0.61 / 0.60]), 1.0])
+    assert np.isclose(cells.loc[("Classification", "fp16"), "raw_retention"], raw)
+    assert np.isclose(cells.loc[("STS", "binary"), "retention"], 0.78 / 0.80)  # STS keeps the fp32 baseline
+    assert binary["n_tasks"] == 2
+
+
+def test_expansion_cost_prices_every_call_and_times_the_expansion_used(tmp_path):
+    import json
+
+    from thesis_figures import expansion_cost
+
+    folder = tmp_path / "abc"
+    folder.mkdir()
+    (folder / "config.json").write_text(json.dumps({"model": "m", "generation": 1}))
+    calls = [
+        {"query_id": "q1", "status": "incomplete", "latency_s": 9.0, "input_tokens": 100, "output_tokens": 1024},
+        {"query_id": "q1", "status": "completed", "latency_s": 2.0, "input_tokens": 100, "output_tokens": 300},
+        {"query_id": "q2", "status": "completed", "latency_s": 4.0, "input_tokens": 100, "output_tokens": 400},
+    ]
+    (folder / "expansions.jsonl").write_text("\n".join(json.dumps(c) for c in calls) + "\n")
+    cost = expansion_cost(["abc"], root=tmp_path).iloc[0]
+    assert cost["calls"] == 3 and cost["queries"] == 2 and cost["generation"] == 1
+    assert np.isclose(cost["cost_usd"], (300 * 0.10 + 1724 * 0.50) / 1e6)
+    assert np.isclose(cost["latency_median_s"], 3.0) and cost["output_tokens_median"] == 350

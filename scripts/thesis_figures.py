@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 """Thesis figures and tables from the frozen result tables (thesis plan §3.3, §5).
 
-Reads only `storage/frozen/` (data freeze of 3 Nov 2026, logging §100), checks the
-files against `SHA256SUMS`, applies the row filter that defines each evaluation set
-(the README there), and writes into `--out` (default `storage/thesis/`):
+Reads only `storage/frozen/` (data freeze of 3 Nov 2026, logging §100; pre-freeze runs
+added 10 Nov, §111), checks the files against `SHA256SUMS`, applies the row filter that
+defines each evaluation set (the README there), and writes into `--out` (default
+`storage/thesis/`). The one other input is the query-expansion records behind T14's
+cost line (`storage/query_expansions/<hash>/expansions.jsonl`), whose hashes go into
+`manifest.json`.
 
 - `tables/T<n>.tex`: booktabs tabulars to `\\input` inside a `table` environment, and
   the unformatted numbers behind each as `T<n>.csv`;
@@ -50,6 +53,8 @@ FILES = {
     "impresso": "impresso_collect_results.csv",
     "seeds": "seed_check_results.csv",
     "expanded": "impresso_expanded_results.csv",
+    "nonretrieval": "nonretrieval_collect_results.csv",
+    "prefreeze": "prefreeze_results.csv",
 }
 FILTERS = {
     "expanded": "Impresso rows only (3,780 original + 840 expanded, pseudo-document, concat, generation 0); paired on backbone, run_id, base task",
@@ -57,7 +62,18 @@ FILTERS = {
     "beir": "task_type Retrieval (all rows; PCA cells are restore)",
     "impresso": "task starts with Impresso (3,780 rows)",
     "seeds": "tasks of the set; dr_seed empty = default seed 42; PCA cells restore",
+    "nonretrieval": "task_type in {STS, Classification, Clustering}; PCA restore; mean over subsets per task, then over tasks; Classification and Clustering against Full / fp16",
+    "subtract": "pca_mean subtract (NanoBEIR from nanobeir_results_restore.csv; BEIR = tier2 tasks and Impresso = task starts with Impresso without __qe- from prefreeze_results.csv); default seed",
+    "expansion": "task contains __qe- (pseudo-document, 2 generations x concat/replace), paired on backbone, run_id, base task with the original Impresso rows",
 }
+EXPANSIONS = ROOT / "storage" / "query_expansions"
+MAIN_EXPANSION = "65097fce64803627"
+"""Generation 0 of the pseudo-document expansion, concatenated to the query: the main
+result of 5.8 (T14, K1). Generation 1, the expansion alone and R@5 are the supporting
+results (K2; plan 5.8, supervisor 10.11)."""
+QE_PRICES = (0.10, 0.50)
+"""USD per million input and output tokens of the expansion model, as passed to
+`expand_queries.py` (logging §90, §106)."""
 
 # --- Thesis names and orders (plan §5.3) ---------------------------------------------
 
@@ -192,18 +208,31 @@ class Frozen:
             self._frames[name] = analysis.read_results([self.frozen / FILES[name]])
         return self._frames[name]
 
-    def rows(self, evaluation_set: str, metric: str | None = None) -> pd.DataFrame:
-        """`analysis.scored_rows` of one evaluation set (retrieval, PCA restore)."""
-        frame = self.frame(evaluation_set)
+    def rows(
+        self, evaluation_set: str, metric: str | None = None, *, pca_mean: str = "restore", source: str | None = None
+    ) -> pd.DataFrame:
+        """`analysis.scored_rows` of one evaluation set (retrieval, default seed).
+
+        PCA cells of one `pca_mean` mode. `source` reads the set's tasks from another
+        frozen file: the subtracted BEIR and Impresso cells are in `prefreeze`."""
+        frame = self.frame(source or evaluation_set)
         if evaluation_set == "impresso":
-            frame = frame[frame["task"].str.startswith("Impresso")].copy()
+            frame = frame[frame["task"].str.startswith("Impresso") & ~frame["task"].str.contains("__qe-")].copy()
             frame["task_type"] = "Retrieval"
             frame["main_score_name"] = "ndcg_at_10"
+        else:
+            frame = frame[frame["task"].isin(TIER_TASKS[{"nanobeir": "tier1", "beir": "tier2"}[evaluation_set]])]
         if metric:
             frame = frame.assign(main_score=frame[metric]).dropna(subset=["main_score"])
-        rows = analysis.scored_rows(frame, pca_mean="restore")
+        rows = analysis.scored_rows(frame, pca_mean=pca_mean)
         rows = rows[rows["dr_seed"].isna() | (rows["dr_seed"] == DEFAULT_DR_SEED)]
         return rows
+
+    def subtracted_rows(self, evaluation_set: str) -> pd.DataFrame:
+        """The set's rows with PCA cells mean-subtracted (T12): NanoBEIR from its own
+        file, BEIR and Impresso from the pre-freeze runs."""
+        source = "nanobeir" if evaluation_set == "nanobeir" else "prefreeze"
+        return self.rows(evaluation_set, pca_mean="subtract", source=source)
 
     def seed_cells(self, evaluation_set: str) -> pd.DataFrame:
         """One row per (cell, seed) of the seed file for one set: means over tasks."""
@@ -843,20 +872,312 @@ def table_impresso(output: Output, impresso: pd.DataFrame, impresso_r5: pd.DataF
     output.table("T11", latex, data)
 
 
-def table_expansion(output: Output, ledger: Ledger, frozen: Frozen) -> None:
-    """K1 (appendix): LLM query expansion on Impresso, expanded minus original queries.
+PCA_MEAN_ROWS = (("pca", "none"), ("pca", "equal_count_2"), ("pca", "binary"), ("pca_ror", "equal_count_2"), ("pca_ror", "binary"))
+"""T12's rows: PCA at fp32 and at 1-2 bits, PCA+ROR at 1-2 bits (equal to PCA at fp32).
+These are the cells scored with the mean subtracted on all three sets (run B)."""
 
-    Per reference configuration and backbone, the nDCG@10 difference in pp (mean over
-    the four tasks), then retention under each query form against its own fp32
-    baseline (mean over backbones and tasks), and `recovered`: the expanded compressed
-    score minus the original fp32 score (>= 0 would mean expansion makes up the whole
-    compression loss). Pairing as in `scripts/analyse_expansion.py`.
-    """
+
+def pca_mean_gain(restored: pd.DataFrame, subtracted: pd.DataFrame) -> pd.DataFrame:
+    """Retention with the PCA mean restored minus subtracted (pp), per PCA cell scored
+    both ways (`cell_summary` frames of one set)."""
+    keys = list(analysis.CELL_KEYS)
+    sides = {}
+    for name, cells in (("restore", restored), ("subtract", subtracted)):
+        pca = cells[cells["dr_method"].isin(analysis.PCA_METHODS)]
+        sides[name] = pca.set_index(keys)["retention"]
+    joined = pd.concat(sides, axis=1).dropna()
+    joined["gain"] = (joined["restore"] - joined["subtract"]) * 100
+    return joined.reset_index()
+
+
+def table_pca_mean(output: Output, ledger: Ledger, gains: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """T12: PCA mean restored minus subtracted by k x configuration x set (pp)."""
+    rows, data, breaks = [], [], []
+    for dr_method, quant in PCA_MEAN_ROWS:
+        breaks.append(len(rows))
+        for dim in DIMS:
+            line = [f"{DR[dr_method]} / {QUANT[quant]}" if dim == DIMS[0] else "", str(dim)]
+            record = {"dr_method": dr_method, "quant_method": quant, "target_dim": dim}
+            for evaluation_set, gain in gains.items():
+                part = gain[(gain["dr_method"] == dr_method) & (gain["quant_method"] == quant) & (gain["target_dim"] == dim)]["gain"]
+                line.append(span(part.mean(), part.min(), part.max()) if len(part) else "--")
+                record.update({f"{evaluation_set}_mean": part.mean(), f"{evaluation_set}_min": part.min(), f"{evaluation_set}_max": part.max(), f"{evaluation_set}_n": len(part)})
+            rows.append(line)
+            data.append(record)
+    latex = latex_table(
+        ["Configuration", "$k$"] + [SETS[s] for s in gains],
+        rows,
+        "llrrr",
+        midrule_before=breaks,
+        notes=[
+            "T12: retention with the PCA mean restored minus subtracted (pp): mean over the five backbones, range in parentheses. Default seed.",
+            "PCA+ROR at fp32 equals PCA and is not repeated. Positive: restoring the mean is better.",
+        ],
+    )
+    output.table("T12", latex, pd.DataFrame(data))
+    files = {"nanobeir": FILES["nanobeir"], "beir": FILES["beir"] + " + " + FILES["prefreeze"], "impresso": FILES["impresso"] + " + " + FILES["prefreeze"]}
+    for evaluation_set, gain in gains.items():
+        def mean_of(dr_method: str, quant: str, dim: int) -> float:
+            return gain[(gain["dr_method"] == dr_method) & (gain["quant_method"] == quant) & (gain["target_dim"] == dim)]["gain"].mean()
+
+        for dim in DIMS:
+            ledger.add(("pcaMeanGain", SETS[evaluation_set], "fp32", f"k{dim}"), pp(mean_of("pca", "none", dim)), files[evaluation_set], FILTERS["subtract"], f"pca-{dim}/fp32 retention, restore minus subtract, mean over backbones; x100")
+        for dr_method in ("pca", "pca_ror"):
+            ledger.add(("pcaMeanGain", SETS[evaluation_set], DR[dr_method], "binary", "k512"), pp(mean_of(dr_method, "binary", 512)), files[evaluation_set], FILTERS["subtract"], f"{dr_method}-512/binary retention, restore minus subtract, mean over backbones; x100")
+    return pd.DataFrame(data)
+
+
+TASK_TYPES = ("STS", "Classification", "Clustering")
+FP16_REFERENCED = ("Classification", "Clustering")
+"""Task types whose retention is taken against Full / fp16 rather than the raw fp32
+baseline: their scorers (a trained classifier, k-means) are not scale-invariant, and
+mDenseOn's raw output is not normalized while every configuration is (run sheet §F)."""
+TASK_TYPE_LEDGER = {
+    "Full / binary": ("none", 0, "binary"),
+    "Full / int2": ("none", 0, "int2"),
+    "PCA-64 / fp32": ("pca", 64, "none"),
+    "RP-64 / fp32": ("random_projection", 64, "none"),
+    "RS-64 / fp32": ("random_selection", 64, "none"),
+}
+"""Cells quoted in 5.7 beside the reference configurations (plan §2, 5.7)."""
+
+
+def task_type_cells(frame: pd.DataFrame) -> pd.DataFrame:
+    """Retention per (task type, cell), non-retrieval set: mean over subsets within a
+    task, then over tasks, so each task counts once. Classification and clustering
+    against Full / fp16 (`FP16_REFERENCED`); `raw_retention` keeps the fp32 one."""
+    keys = list(analysis.SCORE_KEYS)
+    parts = []
+    for task_type in TASK_TYPES:
+        rows = analysis.scored_rows(frame, task_type=task_type, pca_mean="restore")
+        rows = rows[rows["dr_seed"].isna() | (rows["dr_seed"] == DEFAULT_DR_SEED)].copy()
+        rows["raw_retention"] = rows["retention"]
+        if task_type in FP16_REFERENCED:
+            reference = rows[(rows["dr_method"] == "none") & (rows["quant_method"] == "fp16")]
+            rows = rows.merge(reference[keys + ["main_score"]].rename(columns={"main_score": "reference"}), on=keys, how="left", validate="many_to_one")
+            if rows["reference"].isna().any():
+                raise ValueError(f"{task_type}: Full / fp16 missing for some task")
+            rows["retention"] = rows["main_score"] / rows["reference"]
+        cell_keys = list(analysis.CELL_KEYS) + ["bytes_per_vector"]
+        per_task = rows.groupby(cell_keys + ["task"], dropna=False)[["main_score", "retention", "raw_retention"]].mean().reset_index()
+        cells = (
+            per_task.groupby(cell_keys, dropna=False)
+            .agg(score=("main_score", "mean"), retention=("retention", "mean"), raw_retention=("raw_retention", "mean"), n_tasks=("task", "nunique"))
+            .reset_index()
+        )
+        parts.append(cells.assign(task_type=task_type))
+    return pd.concat(parts, ignore_index=True)
+
+
+def retention_span(values: pd.Series) -> str:
+    """`95.3 (92.6--97.1)`: mean over backbones, range in parentheses (percent)."""
+    return f"{percent(values.mean())} ({percent(values.min())}--{percent(values.max())})"
+
+
+def select(cells: pd.DataFrame, dr_method: str, dim: int, quant: str) -> pd.DataFrame:
+    return cells[(cells["dr_method"] == dr_method) & (cells["target_dim"] == dim) & (cells["quant_method"] == quant)]
+
+
+def table_task_types(output: Output, ledger: Ledger, beir: pd.DataFrame, types: pd.DataFrame) -> None:
+    """T13: retention of the reference configurations per task type, next to BEIR."""
+    sets = {"BEIR": beir, **{t: types[types["task_type"] == t] for t in TASK_TYPES}}
+    n_tasks = {name: int(frame["n_tasks"].max()) for name, frame in sets.items()}
+    rows, data = [], []
+    for name, (dr_method, dim, quant) in REFERENCE.items():
+        line = [name]
+        for column, cells in sets.items():
+            part = select(cells, dr_method, dim, quant)
+            if column in FP16_REFERENCED and name == "Full / fp16":
+                line.append("ref.")
+            else:
+                line.append(retention_span(part["retention"]) if len(part) else "--")
+            data.append({"configuration": name, "set": column, "mean": part["retention"].mean(), "min": part["retention"].min(), "max": part["retention"].max(), "n_backbones": len(part)})
+        rows.append(line)
+    latex = latex_table(
+        ["Configuration"] + [f"{name} ({n_tasks[name]})" for name in sets],
+        rows,
+        "l" + "r" * len(sets),
+        notes=[
+            "T13: retention (%) of the reference configurations per task type: mean over the five backbones, range in parentheses; number of tasks in the header.",
+            "Mean over subsets within a task, then over tasks. STS against the fp32 baseline; classification and clustering against Full / fp16 (ref.), because mDenseOn's raw output is not normalized.",
+        ],
+    )
+    output.table("T13", latex, pd.DataFrame(data))
+    types.to_csv(output.out / "tables" / "T13_cells.csv", index=False)
+    for column, cells in sets.items():
+        source = FILES["beir"] if column == "BEIR" else FILES["nonretrieval"]
+        filter_ = FILTERS["beir"] if column == "BEIR" else FILTERS["nonretrieval"]
+        for name, (dr_method, dim, quant) in TASK_TYPE_LEDGER.items():
+            part = select(cells, dr_method, dim, quant)["retention"]
+            for side, value in (("min", part.min()), ("max", part.max())):
+                ledger.add(("taskType", column, name, side), percent(value), source, filter_, f"{name} retention, mean over tasks; {'smallest' if side == 'min' else 'largest'} backbone; x100 (default seed)")
+    classification = sets["Classification"]
+    pca = classification[(classification["dr_method"] == "pca") & (classification["quant_method"] == "none") & (classification["target_dim"] > 0)]
+    ledger.add(("taskType", "Classification", "PCA", "fp32", "min"), percent(pca["retention"].min()), FILES["nonretrieval"], FILTERS["nonretrieval"], "pca-k/fp32 retention, smallest over backbones and k = 64..512; x100")
+    for task_type in FP16_REFERENCED:
+        part = select(sets[task_type], "none", 0, "fp16").set_index("backbone")["raw_retention"]
+        ledger.add(("taskType", task_type, "rawBaseline", "Mdenseon"), percent(part["mdenseon"]), FILES["nonretrieval"], FILTERS["nonretrieval"].split(";")[0], "mDenseOn Full / fp16 against its raw (unnormalized) fp32 baseline, mean over tasks; x100")
+
+
+def expansion_pairs(frozen: Frozen, metric: str) -> pd.DataFrame:
+    """Original and expanded queries paired per cell (`analyse_expansion.paired_cells`),
+    for Full / fp32 and the reference configurations, every generation and mode."""
     from analyse_expansion import paired_cells
 
-    pairs = paired_cells(frozen.frame("expanded"), "main_score")
+    pairs = paired_cells(frozen.frame("prefreeze"), metric)
     names = {name.replace(" / ", "/"): name for name in ["Full / fp32", *REFERENCE]}
-    pairs = pairs[pairs["config"].isin(names)].assign(config=lambda f: f["config"].map(names))
+    return pairs[pairs["config"].isin(names)].assign(config=lambda f: f["config"].map(names))
+
+
+def expansion_cost(hashes: Iterable[str], root: Path = EXPANSIONS) -> pd.DataFrame:
+    """Query-time cost of each expansion generation from its records: API latency of
+    the expansion used per query (the last record), tokens and price of every call."""
+    records = []
+    for digest in hashes:
+        path = root / digest / "expansions.jsonl"
+        if not path.exists():
+            print(f"warning: {path} missing; no cost for {digest}", file=sys.stderr)
+            continue
+        calls = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        used = {}
+        for call in calls:
+            used[call["query_id"]] = call
+        used = [call for call in used.values() if call["status"] == "completed"]
+        latency = np.array([call["latency_s"] for call in used if call.get("latency_s") is not None])
+        tokens_in = sum(call.get("input_tokens") or 0 for call in calls)
+        tokens_out = sum(call.get("output_tokens") or 0 for call in calls)
+        config = json.loads((root / digest / "config.json").read_text())
+        records.append(
+            {
+                "hash": digest,
+                "generation": int(config.get("generation", 0)),
+                "model": config["model"],
+                "queries": len(used),
+                "calls": len(calls),
+                "input_tokens": tokens_in,
+                "output_tokens": tokens_out,
+                "cost_usd": (tokens_in * QE_PRICES[0] + tokens_out * QE_PRICES[1]) / 1e6,
+                "latency_median_s": float(np.median(latency)),
+                "latency_p95_s": float(np.percentile(latency, 95)),
+                "output_tokens_median": float(np.median([call["output_tokens"] for call in used])),
+                "sha256": sha256(path),
+            }
+        )
+    return pd.DataFrame(records).sort_values("generation") if records else pd.DataFrame()
+
+
+def main_variant(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Rows of the main expansion result: generation 0, query + expansion."""
+    return pairs[(pairs["hash"] == MAIN_EXPANSION) & (pairs["combine"] == "concat")]
+
+
+def table_expansion_main(output: Output, ledger: Ledger, pairs: pd.DataFrame, cost: pd.DataFrame) -> None:
+    """T14 (5.8): does query expansion make up the compression loss? Per reference
+    configuration, the nDCG@10 change from compression, from adding the expansion to the
+    query, and the net change against the original fp32 score. Main variant only
+    (`MAIN_EXPANSION`, concat), mean over backbones and tasks; the cost line from the
+    records of both generations."""
+    order = ["Full / fp32", *REFERENCE]
+    main = main_variant(pairs).groupby("config")
+    table = pd.DataFrame(
+        {"compression": -main["loss"].mean() * 100, "expansion": main["delta"].mean() * 100, "net": main["recovered"].mean() * 100}
+    ).loc[order]
+    rows = []
+    for config in order:
+        values = table.loc[config]
+        fp32 = config == "Full / fp32"
+        rows.append([config, "--" if fp32 else pp(values["compression"]), pp(values["expansion"]), "--" if fp32 else pp(values["net"])])
+    if len(cost):
+        def low_high(column: str, digits: int = 1) -> str:
+            low, high = cost[column].min(), cost[column].max()
+            return f"{low:.{digits}f}" if round(low, digits) == round(high, digits) else f"{low:.{digits}f}--{high:.{digits}f}"
+
+        line = (
+            f"Query-time cost per query: median {low_high('latency_median_s')} s of API time (95th percentile {low_high('latency_p95_s')} s), "
+            f"{low_high('output_tokens_median', 0)} output tokens; \\${low_high('cost_usd', 2)} per generation of {integer(cost['queries'].max())} queries."
+        )
+        rows.append([f"\\multicolumn{{4}}{{l}}{{\\footnotesize {line}}}"])
+    latex = latex_table(
+        ["Configuration", "Compression", "Expansion", "Net"],
+        rows,
+        "lrrr",
+        midrule_before=[1] + ([len(order)] if len(cost) else []),
+        notes=[
+            "T14: Impresso with LLM query expansion (one pseudo-document per query, concatenated to it; generation 0), nDCG@10 change in pp, mean over the five backbones and four tasks.",
+            "Compression: original queries, configuration minus fp32. Expansion: expanded minus original queries, same configuration. Net: expanded compressed minus original fp32 (>= 0 would mean the loss is made up).",
+            "Cost line: both generations (range). Generation 1, the expansion alone and R@5 are in K2.",
+        ],
+    )
+    output.table("T14", latex, table)
+    if len(cost):
+        cost.to_csv(output.out / "tables" / "T14_cost.csv", index=False)
+    source, filter_ = FILES["prefreeze"], FILTERS["expansion"] + f"; {MAIN_EXPANSION}, concat"
+    compressed = table.drop(index=["Full / fp32", "Full / fp16"])
+    ledger.add(("qe", "net", "min"), pp(compressed["net"].min()), source, filter_, "min over compressed reference configurations (fp16 excluded) of mean(expanded score - original fp32); x100")
+    for _, record in cost.iterrows():
+        generation = f"gen{int(record['generation'])}"
+        file = f"query_expansions/{record['hash']}/expansions.jsonl"
+        ledger.add(("qe", "latency", "median", generation), f"{record['latency_median_s']:.1f}", file, "last record per query", "median API latency per query, s")
+        ledger.add(("qe", "latency", "pNinetyFive", generation), f"{record['latency_p95_s']:.1f}", file, "last record per query", "95th percentile API latency per query, s")
+        ledger.add(("qe", "outputTokens", "median", generation), integer(record["output_tokens_median"]), file, "last record per query", "median output tokens (reasoning included)")
+        ledger.add(("qe", "cost", generation), f"{record['cost_usd']:.2f}", file, "every call", f"input x {QE_PRICES[0]} + output x {QE_PRICES[1]} USD per million tokens")
+
+
+def table_expansion_support(output: Output, ledger: Ledger, pairs: pd.DataFrame, recall: pd.DataFrame, generations: dict[str, int]) -> None:
+    """K2 (appendix): the supporting expansion results next to the main one: expanded
+    minus original per reference configuration, for both generations, query + expansion
+    and the expansion alone, nDCG@10 and R@5. Mean over backbones and tasks."""
+    order = ["Full / fp32", *REFERENCE]
+    hashes = sorted(pairs["hash"].unique(), key=lambda h: generations.get(h, 0 if h == MAIN_EXPANSION else 1))
+    label = {h: f"Gen. {generations.get(h, '?')}" for h in hashes}
+    columns, groups = {}, []
+    for metric, frame in (("nDCG@10", pairs), ("R@5", recall)):
+        for combine, name in (("concat", "query + expansion"), ("replace", "expansion alone")):
+            part = frame[frame["combine"] == combine]
+            if part.empty:
+                continue
+            for digest in hashes:
+                columns[(metric, combine, digest)] = part[part["hash"] == digest].groupby("config")["delta"].mean() * 100
+            groups.append((f"{metric}, {name}", len(hashes)))
+    table = pd.DataFrame(columns).loc[order]
+    rows = [[config] + [pp(value) for value in table.loc[config]] for config in order]
+    latex = latex_table(
+        ["Configuration"] + [label[digest] for _, _, digest in table.columns],
+        rows,
+        "l" + "r" * len(table.columns),
+        groups=[("", 1)] + groups,
+        midrule_before=[1],
+        notes=[
+            "K2: expanded minus original queries (pp) per reference configuration, mean over the five backbones and four tasks, for both generations of the pseudo-document expansion (same model, prompt and settings).",
+            "Query + expansion: concatenated (the main result, T14, is generation 0 of this). Expansion alone: replaces the query.",
+        ],
+    )
+    output.table("K2", latex, table.set_axis([f"{m} {c} {d}" for m, c, d in table.columns], axis=1))
+    source = FILES["prefreeze"]
+    concat = table.xs("concat", axis=1, level=1).xs("nDCG@10", axis=1, level=0)
+    spread = (concat.max(axis=1) - concat.min(axis=1)).max()
+    ledger.add(("qe", "generations", "spread", "max"), f"{spread:.1f}", source, FILTERS["expansion"] + "; concat", "largest difference between the two generations of the mean nDCG@10 delta over the reference configurations and Full / fp32; pp")
+    for digest in hashes:
+        generation = f"gen{generations.get(digest, '?')}"
+        for metric, combine, part in (("Ndcg", "concat", "nDCG@10"), ("Ndcg", "replace", "nDCG@10"), ("RecallFive", "concat", "R@5"), ("RecallFive", "replace", "R@5")):
+            if (part, combine, digest) not in table.columns:
+                continue
+            value = table.loc["Full / fp32", (part, combine, digest)]
+            ledger.add(("qe", "fp32", metric, combine, generation), pp(value), source, FILTERS["expansion"] + f"; {digest}, {combine}", f"expanded minus original fp32 {part}, mean over backbones and tasks; x100")
+
+
+def table_expansion(output: Output, ledger: Ledger, pairs: pd.DataFrame) -> None:
+    """K1 (appendix): LLM query expansion on Impresso, expanded minus original queries.
+
+    The main variant (`MAIN_EXPANSION`, query + expansion). Per reference configuration
+    and backbone, the nDCG@10 difference in pp (mean over the four tasks), then
+    retention under each query form against its own fp32 baseline (mean over backbones
+    and tasks), and `recovered`: the expanded compressed score minus the original fp32
+    score (>= 0 would mean expansion makes up the whole compression loss). Pairing as
+    in `scripts/analyse_expansion.py`.
+    """
+    pairs = main_variant(pairs)
+    names = {name: name for name in ["Full / fp32", *REFERENCE]}
     per_backbone = pairs.groupby(["config", "backbone"])["delta"].mean().unstack("backbone") * 100
     summary = pairs.groupby("config").agg(
         delta=("delta", "mean"),
@@ -885,7 +1206,7 @@ def table_expansion(output: Output, ledger: Ledger, frozen: Frozen) -> None:
         groups=[("", 1), ("$\\Delta$ nDCG@10, expanded $-$ original (pp)", len(backbones) + 1), ("Retention (\\%)", 2), ("", 1)],
         midrule_before=[1],
         notes=[
-            "K1: Impresso with LLM query expansion (one pseudo-document per query, concatenated to it; one generation). Mean over the four tasks; Mean/Retention/Recovered also over backbones.",
+            "K1: Impresso with LLM query expansion (one pseudo-document per query, concatenated to it; generation 0). Mean over the four tasks; Mean/Retention/Recovered also over backbones.",
             "Recovered: expanded compressed score minus original fp32 score (pp); >= 0 would mean the whole compression loss is made up. Retention: each query form against its own fp32 baseline.",
         ],
     )
@@ -897,7 +1218,7 @@ def table_expansion(output: Output, ledger: Ledger, frozen: Frozen) -> None:
         "% K1 companion: fp32 delta per backbone and task (CSV only)\n",
         fp32.pivot_table(index="backbone", columns="base", values="delta") * 100,
     )
-    source, filter_ = FILES["expanded"], FILTERS["expanded"]
+    source, filter_ = FILES["prefreeze"], FILTERS["expansion"] + f"; {MAIN_EXPANSION}, concat"
     ledger.add(("expansion", "fp32", "delta", "mean"), pp(summary.loc["Full / fp32", "delta"] * 100), source, filter_, "expanded minus original fp32 nDCG@10, mean over backbones and tasks; x100")
     for backbone in backbones:
         ledger.add(("expansion", "fp32", "delta", BACKBONE_MACRO[backbone]), pp(per_backbone.loc["Full / fp32", backbone]), source, filter_, "expanded minus original fp32 nDCG@10, mean over the four tasks; x100")
@@ -1187,7 +1508,23 @@ def main(argv: list[str] | None = None) -> int:
     scale = analysis.scale_cost(paired)
     table_scale_cost(output, ledger, scale, transfer, paired)
     table_impresso(output, rows["impresso"], impresso_r5)
-    table_expansion(output, ledger, frozen)
+
+    gains = {}
+    for name in ("nanobeir", "beir", "impresso"):
+        subtracted = analysis.cell_summary(frozen.subtracted_rows(name))
+        gains[name] = pca_mean_gain(cells[name], subtracted).assign(set=name)
+    table_pca_mean(output, ledger, gains)
+    pd.concat(gains.values(), ignore_index=True).to_csv(args.out / "tables" / "T12_cells.csv", index=False)
+
+    table_task_types(output, ledger, cells["beir"], task_type_cells(frozen.frame("nonretrieval")))
+
+    pairs = expansion_pairs(frozen, "main_score")
+    recall_pairs = expansion_pairs(frozen, "recall_at_5")
+    cost = expansion_cost(sorted(pairs["hash"].unique()))
+    generations = {record["hash"]: int(record["generation"]) for _, record in cost.iterrows()}
+    table_expansion_main(output, ledger, pairs, cost)
+    table_expansion(output, ledger, pairs)
+    table_expansion_support(output, ledger, pairs, recall_pairs, generations)
 
     losses = pd.concat(
         [analysis.task_losses(small, REFERENCE).assign(tier="nanobeir"), analysis.task_losses(large, REFERENCE).assign(tier="beir")],
@@ -1225,6 +1562,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {
         "frozen": str(args.frozen),
         "hashes": frozen.hashes,
+        "expansion_records": {record["hash"]: record["sha256"] for _, record in cost.iterrows()},
         "filters": FILTERS,
         "reference_configurations": {name: list(value) for name, value in REFERENCE.items()},
         "written": output.written,
