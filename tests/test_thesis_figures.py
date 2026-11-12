@@ -38,6 +38,27 @@ def test_latex_table_is_booktabs_with_group_header():
     assert "\\multicolumn{1}{c}{set}" in text and "\\cmidrule(lr){2-2}" in text
 
 
+def test_an_empty_group_fills_all_the_columns_it_spans():
+    """T9's header: two unlabelled columns, then BEIR over three, Impresso over two."""
+    text = latex_table(list("abcdefg"), [list("1234567")], "lrlrrlr", groups=[("", 2), ("BEIR", 3), ("Impresso", 2)])
+    group_line = next(line for line in text.splitlines() if "multicolumn" in line)
+    assert group_line.startswith(" &  & \\multicolumn{3}{c}{BEIR}")
+    assert "\\cmidrule(lr){3-5} \\cmidrule(lr){6-7}" in text
+
+
+def test_best_per_budget_flags_a_runner_up_within_half_a_point_as_a_tie():
+    table = cells(
+        [
+            {"backbone": "mgte", "dr_method": "pca", "target_dim": 64, "quant_method": "equal_count_2", "bytes_per_vector": 16, "score": 0.300, "retention": 0.6},
+            {"backbone": "mgte", "dr_method": "pca_ror", "target_dim": 64, "quant_method": "equal_count_2", "bytes_per_vector": 16, "score": 0.297, "retention": 0.59},
+            {"backbone": "mgte", "dr_method": "pca", "target_dim": 128, "quant_method": "equal_count_2", "bytes_per_vector": 32, "score": 0.350, "retention": 0.7},
+        ]
+    )
+    best = best_per_budget(table).set_index("budget")
+    assert bool(best.loc[16, "tie"]) and best.loc[16, "runner_up"] == "PCA+ROR-64 / EC-2"
+    assert not bool(best.loc[32, "tie"])  # 0.350 against 0.300: five points apart
+
+
 def cells(records):
     frame = pd.DataFrame(records)
     frame["label"] = frame["dr_method"] + "-" + frame["target_dim"].astype(str) + "/" + frame["quant_method"]
@@ -73,6 +94,29 @@ def test_best_per_budget_takes_the_highest_score_at_or_under_the_budget():
     best = best_per_budget(table).set_index("budget")
     assert best.loc[8, "configuration"] == "PCA-64 / binary"
     assert best.loc[16, "configuration"] == "PCA-64 / EC-2" and best.loc[256, "configuration"] == "PCA-64 / EC-2"
+
+
+def test_seed_counts_need_the_same_seeds_in_every_cell():
+    import pytest
+
+    from thesis_figures import Ledger, seed_counts
+
+    def frame(seed_sets):
+        rows = [{"backbone": "b", "dr_method": "none", "target_dim": 0, "quant_method": "none", "dr_seed": 42}]
+        for dim, seeds in zip((64, 128), seed_sets):
+            rows += [{"backbone": "b", "dr_method": "random_selection", "target_dim": dim, "quant_method": "none", "dr_seed": s} for s in seeds]
+        rows.append({"backbone": "b", "dr_method": "truncate", "target_dim": 64, "quant_method": "none", "dr_seed": 42})
+        # quantized cells keep the default seed only, as on BEIR: not seeded, not an error
+        rows.append({"backbone": "b", "dr_method": "random_selection", "target_dim": 64, "quant_method": "binary", "dr_seed": 42})
+        return pd.DataFrame(rows)
+
+    ledger = Ledger()
+    counts = seed_counts(ledger, {"beir": frame([(42, 1, 2), (42, 1, 2)])})
+    assert counts["n_seeds"].tolist() == [3] and counts.loc[0, "seeds"] == "42 and 1, 2"  # truncation has one seed: skipped
+    assert counts.loc[0, "quantizers"] == "fp32 only" and counts.loc[0, "n_cells"] == 2
+    assert {row["macro"]: row["value"] for row in ledger.rows} == {"numSeedsBEIRRS": "3", "numSeedsBEIR": "3"}
+    with pytest.raises(ValueError):
+        seed_counts(Ledger(), {"beir": frame([(42, 1, 2), (42, 1)])})
 
 
 def test_points_never_print_negative_zero():

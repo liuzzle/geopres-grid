@@ -17,7 +17,7 @@ cost line (`storage/query_expansions/<hash>/expansions.jsonl`), whose hashes go 
 
 Thesis names and orders (plan §5.3) are fixed here once; a code name never reaches a
 label. Formats (§5.4): nDCG@10 x 100 with one decimal, retention in percent with one
-decimal, differences in pp with a sign, Spearman with two decimals, budgets in bytes.
+decimal, differences in pp with a sign, Spearman with three decimals, budgets in bytes.
 Random DR methods at fp32 are the seed mean ± std; quantized cells are the default
 seed (§3.2). BEIR supplies every effect size; NanoBEIR the 10-seed checks and the
 transfer; Impresso the domain check.
@@ -128,6 +128,9 @@ IMPRESSO_FOLDERS = {
 DIMS = (64, 128, 256, 512)
 BUDGETS = (8, 16, 32, 64, 128, 256)
 RANDOM_METHODS = ("random_projection", "random_selection")
+TIE = 0.5
+"""Two configurations closer than this (pp, or points of nDCG@10 x 100) are a tie, never
+'best' (plan §5.5)."""
 
 REFERENCE: dict[str, tuple[str, int, str]] = {
     "Full / fp16": ("none", 0, "fp16"),
@@ -272,12 +275,14 @@ def pp(value: float) -> str:
 
 
 def rho(value: float) -> str:
-    return f"{value:.2f}"
-
-
-def rho3(value: float) -> str:
-    """Three decimals, for correlations so close to 1 that two would print 1.00."""
+    """Spearman with three decimals (plan §5.4.3): the transfer values sit above 0.99,
+    where two would print 1.00, and one rule for every correlation keeps them comparable."""
     return f"{value:.3f}"
+
+
+def rho_label(value: float) -> str:
+    """The same three decimals for a figure label, with a true minus sign."""
+    return rho(value).replace("-", "−")
 
 
 def integer(value: float) -> str:
@@ -331,7 +336,8 @@ def latex_table(
     if groups:
         cells, rules, column = [], [], 1
         for text, width in groups:
-            cells.append(f"\\multicolumn{{{width}}}{{c}}{{{text}}}" if text else "")
+            # An empty group still fills `width` cells, or every later group slides left.
+            cells.extend([f"\\multicolumn{{{width}}}{{c}}{{{text}}}"] if text else [""] * width)
             if text:
                 rules.append(f"\\cmidrule(lr){{{column}-{column + width - 1}}}")
             column += width
@@ -747,7 +753,9 @@ def best_per_budget(cells: pd.DataFrame) -> pd.DataFrame:
             within = own[own["bytes_per_vector"] <= budget]
             if within.empty:
                 continue
-            best = within.sort_values(["score", "bytes_per_vector", "label"], ascending=[False, True, True]).iloc[0]
+            ranked = within.sort_values(["score", "bytes_per_vector", "label"], ascending=[False, True, True])
+            best = ranked.iloc[0]
+            runner = ranked.iloc[1] if len(ranked) > 1 else None
             records.append(
                 {
                     "backbone": backbone,
@@ -756,6 +764,10 @@ def best_per_budget(cells: pd.DataFrame) -> pd.DataFrame:
                     "bytes_per_vector": int(best["bytes_per_vector"]),
                     "retention": float(best["retention"]),
                     "score": float(best["score"]),
+                    "runner_up": config_name(runner["dr_method"], runner["target_dim"], runner["quant_method"]) if runner is not None else None,
+                    "runner_up_score": float(runner["score"]) if runner is not None else np.nan,
+                    # The pick is made on mean nDCG@10, so the tie (plan §5.5) is judged on it too.
+                    "tie": bool(runner is not None and (best["score"] - runner["score"]) * 100 < TIE),
                 }
             )
     return pd.DataFrame(records)
@@ -766,6 +778,11 @@ def table_budget(output: Output, ledger: Ledger, cells: dict[str, pd.DataFrame])
     beir = best_per_budget(cells["beir"]).set_index(["backbone", "budget"])
     impresso = best_per_budget(cells["impresso"]).set_index(["backbone", "budget"])
     joined = beir.join(impresso, lsuffix="_beir", rsuffix="_impresso", how="left").reset_index()
+    def named(configuration: Any, tie: Any) -> str:
+        if not isinstance(configuration, str):
+            return "--"
+        return configuration + ("$^{\\dagger}$" if tie is True else "")
+
     rows, breaks, previous = [], [], None
     for index, record in joined.iterrows():
         if record["backbone"] != previous:
@@ -775,10 +792,10 @@ def table_budget(output: Output, ledger: Ledger, cells: dict[str, pd.DataFrame])
             [
                 BACKBONES[record["backbone"]] if index in breaks else "",
                 str(record["budget"]),
-                record["configuration_beir"],
+                named(record["configuration_beir"], record["tie_beir"]),
                 percent(record["retention_beir"]),
                 score(record["score_beir"]),
-                record["configuration_impresso"] if isinstance(record["configuration_impresso"], str) else "--",
+                named(record["configuration_impresso"], record["tie_impresso"]),
                 percent(record["retention_impresso"]) if pd.notna(record["retention_impresso"]) else "--",
             ]
         )
@@ -790,6 +807,7 @@ def table_budget(output: Output, ledger: Ledger, cells: dict[str, pd.DataFrame])
         midrule_before=breaks,
         notes=[
             "T9: best configuration by mean nDCG@10 among those at or under each budget in bytes per vector, with its retention; mean over the set's tasks.",
+            f"dagger: tie, the runner-up (in T9.csv) is within {TIE} points of mean nDCG@10.",
         ],
     )
     output.table("T9", latex, joined)
@@ -824,7 +842,6 @@ def table_scale_cost(output: Output, ledger: Ledger, scale: pd.DataFrame, transf
     for dim in DIMS:
         ledger.add(("scaleCost", "truncation", f"k{dim}"), pp(fp32.loc["truncate", dim]), FILES["beir"] + " + " + FILES["nanobeir"], "13 shared datasets; PCA restore", "retention(BEIR) - retention(NanoBEIR) for truncate-k/fp32, mean over backbones; x100")
     pooled = transfer[transfer["backbone"] == "pooled"].iloc[0]
-    rho = rho3  # transfer correlations sit above 0.99; two decimals would print 1.00
     ledger.add(("transfer", "spearman", "pooled"), rho(pooled["spearman_retention"]), FILES["beir"] + " + " + FILES["nanobeir"], "13 shared datasets; baseline cell excluded", "Spearman of cell retention NanoBEIR vs BEIR, all backbones pooled")
     per_backbone = transfer[transfer["backbone"] != "pooled"]["spearman_retention"]
     ledger.add(("transfer", "spearman", "min"), rho(per_backbone.min()), FILES["beir"] + " + " + FILES["nanobeir"], "13 shared datasets; baseline cell excluded", "Spearman of cell retention NanoBEIR vs BEIR per backbone; smallest")
@@ -1114,6 +1131,8 @@ def table_expansion_main(output: Output, ledger: Ledger, pairs: pd.DataFrame, co
     source, filter_ = FILES["prefreeze"], FILTERS["expansion"] + f"; {MAIN_EXPANSION}, concat"
     compressed = table.drop(index=["Full / fp32", "Full / fp16"])
     ledger.add(("qe", "net", "min"), pp(compressed["net"].min()), source, filter_, "min over compressed reference configurations (fp16 excluded) of mean(expanded score - original fp32); x100")
+    # T14 prints fp16 too; its net is the fp32 expansion effect, since fp16 loses nothing.
+    ledger.add(("qe", "net", "max"), pp(table.drop(index=["Full / fp32"])["net"].max()), source, filter_, "max over all eight reference configurations (fp16 included, as in T14) of mean(expanded score - original fp32); x100")
     for _, record in cost.iterrows():
         generation = f"gen{int(record['generation'])}"
         file = f"query_expansions/{record['hash']}/expansions.jsonl"
@@ -1157,6 +1176,11 @@ def table_expansion_support(output: Output, ledger: Ledger, pairs: pd.DataFrame,
     concat = table.xs("concat", axis=1, level=1).xs("nDCG@10", axis=1, level=0)
     spread = (concat.max(axis=1) - concat.min(axis=1)).max()
     ledger.add(("qe", "generations", "spread", "max"), f"{spread:.1f}", source, FILTERS["expansion"] + "; concat", "largest difference between the two generations of the mean nDCG@10 delta over the reference configurations and Full / fp32; pp")
+    # One sentence each in 5.8: the ranges over K2's nine rows and both generations.
+    for metric, combine, part in (("Ndcg", "replace", "nDCG@10"), ("RecallFive", "concat", "R@5")):
+        block = table.xs(combine, axis=1, level=1).xs(part, axis=1, level=0)
+        for side, value in (("min", block.min().min()), ("max", block.max().max())):
+            ledger.add(("qe", "range", metric, combine, side), pp(value), source, FILTERS["expansion"] + f"; {combine}", f"expanded minus original {part}, mean over backbones and tasks; {side} over Full / fp32, the eight reference configurations and both generations; x100")
     for digest in hashes:
         generation = f"gen{generations.get(digest, '?')}"
         for metric, combine, part in (("Ndcg", "concat", "nDCG@10"), ("Ndcg", "replace", "nDCG@10"), ("RecallFive", "concat", "R@5"), ("RecallFive", "replace", "R@5")):
@@ -1229,6 +1253,207 @@ def table_expansion(output: Output, ledger: Ledger, pairs: pd.DataFrame) -> None
             ledger.add(("expansion", "retention", config, side), percent(summary.loc[config, f"{side}_retention"]), source, filter_, f"{side} queries: cell / own fp32, mean over backbones and tasks; x100")
 
 
+# --- Numbers quoted in Chapter 5 that no table prints ---------------------------------
+
+
+def noise_floors(ledger: Ledger, cells: dict[str, pd.DataFrame], types: pd.DataFrame) -> pd.DataFrame:
+    """The noise floor of each evaluation set and task type (plan §4.7, §5.5): fp16 and
+    int8 differ only by rounding, so |retention(fp16) - retention(int8)| of the same
+    (backbone, DR method, k) measures how far two configurations can differ by chance.
+    Max and median over those 21 x 5 = 105 settings; default seed, PCA restored;
+    classification and clustering against Full / fp16 as in T13. Two decimals, because
+    classification's sits below 0.1 pp."""
+    frames = {SETS[name]: frame for name, frame in cells.items()}
+    frames.update({task_type: types[types["task_type"] == task_type] for task_type in TASK_TYPES})
+    records = []
+    for name, frame in frames.items():
+        wide = frame[frame["quant_method"].isin(["fp16", "int8"])].pivot_table(
+            index=["backbone", "dr_method", "target_dim"], columns="quant_method", values="retention"
+        )
+        difference = (wide["fp16"] - wide["int8"]).abs() * 100
+        records.append({"set": name, "n": len(difference), "max": difference.max(), "median": difference.median()})
+        source = FILES[{"NanoBEIR": "nanobeir", "BEIR": "beir", "Impresso": "impresso"}.get(name, "nonretrieval")]
+        reference = "Full / fp16" if name in FP16_REFERENCED else "the fp32 baseline"
+        for side in ("max", "median"):
+            ledger.add(("noiseFloor", name, side), f"{records[-1][side]:.2f}", source, f"{name}; default seed; PCA restore", f"|retention(fp16) - retention(int8)| of the same (backbone, DR, k), retention against {reference}; {side} over the {len(difference)} settings; pp")
+    return pd.DataFrame(records)
+
+
+def seed_counts(ledger: Ledger, seeds: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """How many seeds each randomised configuration has, per set and DR method (plan §4.7;
+    Ch. 4 request), so the text and the table notes cannot drift from the data. Counted
+    as distinct `dr_seed` per (backbone, k, quantizer) cell of `Frozen.seed_cells`, the
+    same cells F3, T6 and T8 average over; the default seed 42 is the unseeded rows.
+    A method is seeded at the quantizers where its cells have more than one seed (on BEIR
+    only fp32; the quantized cells are the default seed, plan §3.2). Refuses to write a
+    count unless every seeded cell of a method has the same seeds."""
+    records = []
+    for name, frame in seeds.items():
+        cells = frame[frame["dr_method"] != "none"]
+        per_cell = cells.groupby(["dr_method", "backbone", "target_dim", "quant_method"])["dr_seed"].agg(lambda s: tuple(sorted(set(s))))
+        set_counts = set()
+        for method, part in per_cell.groupby(level="dr_method"):
+            seeded = part[part.map(len) > 1]
+            if seeded.empty:
+                continue  # one seed everywhere: not a seeded method on this set
+            seed_sets = set(seeded)
+            quantizers = sorted(set(seeded.index.get_level_values("quant_method")), key=QUANT_BY_BITS.index)
+            partly = part[part.index.get_level_values("quant_method").isin(quantizers)]
+            if len(seed_sets) != 1 or len(partly) != len(seeded):
+                raise ValueError(f"{name} {method}: cells differ in their seeds: {sorted(set(partly))}")
+            seed_set = seed_sets.pop()
+            covered = "all nine quantizers" if len(quantizers) == len(QUANT) else ", ".join(QUANT[q] for q in quantizers) + " only"
+            part = seeded
+            seeds_text = "42 and " + ", ".join(str(s) for s in seed_set if s != DEFAULT_DR_SEED)
+            records.append({"set": SETS[name], "dr_method": method, "n_seeds": len(seed_set), "seeds": seeds_text, "quantizers": covered, "n_cells": len(part)})
+            set_counts.add(len(seed_set))
+            ledger.add(
+                ("seeds", SETS[name], DR[method].replace("+", "")),
+                str(len(seed_set)),
+                FILES["seeds"],
+                FILTERS["seeds"],
+                f"distinct dr_seed per (backbone, k, quantizer) cell, the same in all {len(part)} cells: seeds {seeds_text}; {covered}; k = 64..512",
+            )
+        if len(set_counts) == 1:
+            ledger.add(("seeds", SETS[name]), str(set_counts.pop()), FILES["seeds"], FILTERS["seeds"], "seeds per seeded configuration, identical for every seeded DR method of the set (see the per-method macros)")
+    return pd.DataFrame(records)
+
+
+def configuration_counts(ledger: Ledger, cells: dict[str, pd.DataFrame], subtracted: dict[str, pd.DataFrame]) -> None:
+    """The size of the grid (plan §1.4; Ch. 4 request): configurations per backbone,
+    counted in every set (the fp32 baseline included), and the mean-subtracted PCA /
+    PCA+ROR configurations per backbone and set (run A, run B, NanoBEIR)."""
+    totals = {name: frame.groupby("backbone").size() for name, frame in cells.items()}
+    sizes = {int(n) for counts in totals.values() for n in counts}
+    if len(sizes) != 1:
+        raise ValueError(f"configurations per backbone differ between sets or backbones: {sizes}")
+    ledger.add(("configurations", "perBackbone"), str(sizes.pop()), ", ".join(FILES[n] for n in cells), "; ".join(FILTERS[n] for n in cells), "cells per backbone (fp32 baseline included), identical for every backbone and set")
+    for name, frame in subtracted.items():
+        counts = frame[frame["dr_method"].isin(analysis.PCA_METHODS)].groupby("backbone").size()
+        if counts.nunique() != 1:
+            raise ValueError(f"{name}: mean-subtracted configurations differ between backbones: {counts.to_dict()}")
+        source = FILES["nanobeir"] if name == "nanobeir" else FILES["prefreeze"]
+        ledger.add(("configurations", "subtracted", SETS[name]), str(int(counts.iloc[0])), source, FILTERS["subtract"], "PCA and PCA+ROR cells scored with the mean subtracted, per backbone (identical for every backbone)")
+
+
+def is_cell(cells: pd.DataFrame, dr_method: str, dim: int, quant: str) -> pd.Series:
+    return (cells["dr_method"] == dr_method) & (cells["target_dim"] == dim) & (cells["quant_method"] == quant)
+
+
+def results_numbers(
+    ledger: Ledger,
+    cells: dict[str, pd.DataFrame],
+    rows: dict[str, pd.DataFrame],
+    beir_seeds: pd.DataFrame,
+    paired: pd.DataFrame,
+    task_sizes: pd.DataFrame,
+) -> None:
+    """Macros for the Chapter 5 sentences that compare or count across a table rather
+    than read one cell of it (plan §2, notes 5.1-5.6; logging §113). Each was first
+    re-derived with plain pandas from the frozen files, independently of this code."""
+    from scipy import stats
+
+    beir_file, both = FILES["beir"], FILES["beir"] + " + " + FILES["nanobeir"]
+
+    # 5.1: how much higher NanoBEIR's absolute scores are (T5's two columns).
+    base = {name: cells[name][is_cell(cells[name], "none", 0, "none")].set_index("backbone")["score"] for name in ("nanobeir", "beir")}
+    gap = (base["nanobeir"] - base["beir"]) * 100
+    for side, value in (("min", gap.min()), ("max", gap.max())):
+        ledger.add(("baselineGap", "NanoBEIRMinusBEIR", side), pp(value), both, "fp32 baseline of each set (T5)", f"NanoBEIR mean nDCG@10 (13 tasks) minus BEIR mean (15 tasks) per backbone; {side} over backbones; x100")
+
+    # 5.3: is PCA best at fp32? Against truncation and the RP / RS seed means (as F3).
+    beir = cells["beir"]
+    random = beir_seeds[beir_seeds["quant_method"].eq("none") & beir_seeds["dr_method"].isin(RANDOM_METHODS)]
+    random = random.groupby(["backbone", "dr_method", "target_dim"])["retention"].mean()
+    verdicts = []
+    for backbone in ordered_backbones(beir):
+        for dim in DIMS:
+            pca = beir[is_cell(beir, "pca", dim, "none") & (beir["backbone"] == backbone)]["retention"].iloc[0]
+            truncation = beir[is_cell(beir, "truncate", dim, "none") & (beir["backbone"] == backbone)]["retention"].iloc[0]
+            rival = max(truncation, *(random.loc[(backbone, method, dim)] for method in RANDOM_METHODS))
+            lead = (pca - rival) * 100
+            verdicts.append({"backbone": backbone, "target_dim": dim, "lead": lead})
+    verdicts = pd.DataFrame(verdicts)
+    filter_ = FILTERS["beir"] + "; RP and RS as the mean over 5 seeds (" + FILES["seeds"] + ")"
+    for name, mask in (("ahead", verdicts["lead"] >= TIE), ("tied", verdicts["lead"].abs() < TIE), ("behind", verdicts["lead"] <= -TIE)):
+        ledger.add(("pcaFpThreeTwo", name, "count"), str(int(mask.sum())), beir_file, filter_, f"(backbone, k) pairs, of {len(verdicts)}, where PCA-k/fp32 retention minus the best other DR method is >= {TIE} / within {TIE} / <= -{TIE} pp")
+    worst = verdicts.loc[verdicts["lead"].idxmin()]
+    ledger.add(("pcaFpThreeTwo", "largestDeficit"), pp(-worst["lead"]), beir_file, filter_, f"largest lead of another DR method over PCA at fp32 ({worst['backbone']}, k = {int(worst['target_dim'])}); x100")
+
+    # 5.3 error analysis: PCA-64 per BEIR task, and its rank correlation with corpus size.
+    rows_beir = rows["beir"]
+    per_task = rows_beir[is_cell(rows_beir, "pca", 64, "none")].groupby("task")["retention"].mean()
+    sizes = task_sizes[task_sizes["set"] == "BEIR"].set_index("task_code")["n_documents"]
+    ledger.add(("pcaSixFour", "taskRetention", "min"), percent(per_task.min()), beir_file, FILTERS["beir"], f"pca-64/fp32 retention per task, mean over backbones; smallest task ({per_task.idxmin()}); x100")
+    ledger.add(("pcaSixFour", "taskRetention", "max"), percent(per_task.max()), beir_file, FILTERS["beir"], f"pca-64/fp32 retention per task, mean over backbones; largest task ({per_task.idxmax()}); x100")
+    large = sizes[sizes >= 1e6].index
+    for side, value in (("min", per_task[large].min()), ("max", per_task[large].max())):
+        ledger.add(("pcaSixFour", "millionCorpora", side), percent(value), beir_file, FILTERS["beir"] + "; tasks with >= 1M documents (T4)", f"pca-64/fp32 retention per task, mean over backbones; {side} over the {len(large)} tasks; x100")
+    ledger.add(("pcaSixFour", "millionCorpora", "count"), str(len(large)), "MTEB descriptive statistics (T4)", "BEIR tasks", "tasks with at least one million documents")
+    spearman = stats.spearmanr(per_task.loc[sizes.index], np.log10(sizes))[0]
+    ledger.add(("pcaSixFour", "taskSizeSpearman"), rho(spearman), beir_file, FILTERS["beir"] + "; corpus sizes from T4 (CQADupstack: mean of its 12 sub-corpora)", "Spearman over the 15 BEIR tasks of pca-64/fp32 retention (mean over backbones) against corpus size")
+
+    # 5.4: who is on the budget frontier beyond 16x compression (F4).
+    front = analysis.budget_frontier(beir)
+    beyond = front[front["compression_factor"] > 16]
+    bits = beyond["bits_per_dim"].astype(int)
+    for name, count in (
+        ("points", len(beyond)),
+        ("PCA", int(beyond["dr_method"].isin(analysis.PCA_METHODS).sum())),
+        ("fourBit", int((bits == 4).sum())),
+        ("twoBit", int((bits == 2).sum())),
+        ("oneBit", int((bits == 1).sum())),
+    ):
+        ledger.add(("frontier", "beyondSixteen", name), str(count), beir_file, FILTERS["beir"], f"budget-frontier cells (F4) with compression factor > 16, all backbones; count ({name})")
+    ledger.add(("frontier", "beyondSixteen", "oneBit", "maxBytes"), integer(beyond[bits == 1]["bytes_per_vector"].max()), beir_file, FILTERS["beir"], "largest bytes per vector of a 1-bit frontier cell beyond 16x")
+
+    # 5.5: would NanoBEIR choose the same configuration per budget? (logging §41.3)
+    choice = analysis.budget_choice(paired)
+    filter_ = "13 shared datasets; every bytes-per-vector size of each backbone's grid is a budget; best cell at or under it by mean nDCG@10"
+    ledger.add(("budgetChoice", "budgets"), str(len(choice)), both, filter_, "number of (backbone, budget) pairs")
+    ledger.add(("budgetChoice", "sameShare"), f"{choice['same'].mean() * 100:.0f}", both, filter_, "share of budgets where NanoBEIR picks BEIR's best cell; %")
+    ledger.add(("budgetChoice", "regret", "mean"), f"{choice['regret'].mean():.1f}", both, filter_, "BEIR nDCG@10 of BEIR's best minus that of NanoBEIR's pick, mean over budgets; points x100")
+    ledger.add(("budgetChoice", "regret", "max"), f"{choice['regret'].max():.1f}", both, filter_, "the same, largest over budgets; points x100")
+    ledger.add(("budgetChoice", "regretAboveOne", "count"), str(int((choice["regret"] > 1).sum())), both, filter_, "budgets where that difference exceeds 1 point")
+
+    # 5.6: Impresso against BEIR, and within Impresso by language and query form.
+    impresso = cells["impresso"]
+    joined = impresso.merge(beir, on=list(analysis.CELL_KEYS), suffixes=("_impresso", "_beir"))
+    joined = joined[~is_cell(joined, "none", 0, "none")]
+    transfer = joined.groupby("backbone").apply(lambda g: stats.spearmanr(g["retention_beir"], g["retention_impresso"])[0], include_groups=False)
+    filter_ = FILTERS["impresso"] + "; " + FILTERS["beir"] + "; baseline cell excluded"
+    files = FILES["impresso"] + " + " + beir_file
+    for side, value in (("min", transfer.min()), ("max", transfer.max())):
+        ledger.add(("impresso", "transferSpearman", side), rho(value), files, filter_, f"Spearman of cell retention BEIR vs Impresso per backbone (188 cells); {side} over backbones")
+    above = joined["retention_impresso"] > joined["retention_beir"]
+    ledger.add(("impresso", "aboveBEIR", "share"), f"{above.mean() * 100:.0f}", files, filter_, "share of (backbone, cell) pairs whose Impresso retention exceeds their BEIR retention; %")
+    lift = joined.assign(lift=(joined["retention_impresso"] - joined["retention_beir"]) * 100).groupby("backbone")["lift"].mean()
+    for side, value in (("min", lift.min()), ("max", lift.max())):
+        ledger.add(("impresso", "aboveBEIR", side), pp(value), files, filter_, f"Impresso minus BEIR retention, mean over the 188 cells per backbone; {side} over backbones; pp")
+    rows_impresso = rows["impresso"]
+    baseline = rows_impresso[rows_impresso["kind"] == "baseline"].groupby("task")["main_score"].mean() * 100
+    groups = {
+        "DE": ["ImpressoCrosslingualDE", "ImpressoMultilingualDE"],
+        "FR": ["ImpressoCrosslingualFR", "ImpressoMultilingualFR"],
+        "crossLingual": ["ImpressoCrosslingualDE", "ImpressoCrosslingualFR"],
+        "sameLanguage": ["ImpressoMultilingualDE", "ImpressoMultilingualFR"],
+    }
+    for name, tasks in groups.items():
+        ledger.add(("impresso", "baseline", name), score(baseline[tasks].mean() / 100), FILES["impresso"], FILTERS["impresso"], f"fp32 nDCG@10, mean over backbones and the tasks {', '.join(tasks)}; x100")
+    by_task = rows_impresso[rows_impresso["kind"] != "baseline"].pivot_table(index=list(analysis.CELL_KEYS), columns="task", values="retention")
+    by_task = by_task.drop(index=[key for key in by_task.index if key[1] == "none" and key[3] == "none"], errors="ignore")
+    for name, (worse, better) in (("language", ("DE", "FR")), ("queryForm", ("crossLingual", "sameLanguage"))):
+        difference = (by_task[groups[worse]].mean(axis=1) - by_task[groups[better]].mean(axis=1)) * 100
+        ledger.add(("impresso", f"{name}Gap", "median"), pp(difference.median()), FILES["impresso"], FILTERS["impresso"], f"retention of {worse} minus {better} (mean of their two tasks) per (backbone, cell), median over the {len(difference)} pairs; pp")
+        ledger.add(("impresso", f"{name}Gap", "share"), f"{(difference < 0).mean() * 100:.0f}", FILES["impresso"], FILTERS["impresso"], f"share of (backbone, cell) pairs where {worse} retains less than {better}; %")
+    winners = best_per_budget(impresso)
+    at64 = winners[winners["budget"] == 64].set_index("backbone")["retention"]
+    beir_pick = impresso[is_cell(impresso, "pca_ror", 256, "equal_count_2")].set_index("backbone")["retention"]
+    behind = (at64 - beir_pick.loc[at64.index]) * 100
+    ledger.add(("impresso", "budgetSixFour", "beirPickBehind", "max"), pp(behind.max()), files, filter_, "64 B: Impresso retention of Impresso's best cell minus that of BEIR's pick (PCA+ROR-256 / EC-2), largest over backbones; pp")
+    ledger.add(("impresso", "budgetSixFour", "otherPick", "count"), str(int((winners[winners["budget"] == 64]["configuration"] != "PCA+ROR-256 / EC-2").sum())), FILES["impresso"], FILTERS["impresso"], "64 B: backbones whose Impresso pick differs from BEIR's (PCA+ROR-256 / EC-2)")
+
+
 # --- Figures -------------------------------------------------------------------------
 
 
@@ -1279,7 +1504,11 @@ def panel_grid(plt, n_panels: int, *, height: float, ncols: int = 3, sharey: boo
 
 
 def corner_label(axis, text: str, corner: str = "upper left") -> None:
-    x, y, ha, va = {"upper left": (0.02, 0.97, "left", "top"), "lower right": (0.98, 0.03, "right", "bottom")}[corner]
+    x, y, ha, va = {
+        "upper left": (0.02, 0.97, "left", "top"),
+        "upper right": (0.98, 0.97, "right", "top"),
+        "lower right": (0.98, 0.03, "right", "bottom"),
+    }[corner]
     axis.text(x, y, text, transform=axis.transAxes, ha=ha, va=va, fontsize=8.5, color=INK)
 
 
@@ -1409,12 +1638,13 @@ def figure_transfer(paired: pd.DataFrame, transfer: pd.DataFrame, paired_tasks: 
     left.set_xlabel("Retention on NanoBEIR (%)")
     left.set_ylabel("Retention on BEIR (%)")
     pooled = transfer.set_index("backbone").loc["pooled", "spearman_retention"]
-    corner_label(left, f"(a)  $\\rho$ = {pooled:.3f}, {len(cells)} configurations")
+    corner_label(left, f"(a)  $\\rho$ = {rho_label(pooled)}, {len(cells)} configurations")
     from matplotlib.lines import Line2D
 
     handles = [Line2D([], [], color=COLOURS[b], marker="o", linestyle="none", label=BACKBONES[b]) for b in ordered_backbones(cells)]
     handles += [Line2D([], [], color=INK, marker=MARKERS[m], linestyle="none", label=DR_LONG[m]) for m in DR if m != "none"]
-    left.legend(handles=handles, loc="lower right", fontsize=6.5, ncol=2, handletextpad=0.1, columnspacing=0.6)
+    # Almost every configuration lies below the diagonal; one column fits the empty corner.
+    left.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, 0.93), fontsize=6.5, ncol=1, handletextpad=0.1, labelspacing=0.25)
 
     configs = [name for name, (dr, _, _) in REFERENCE.items() if dr != "none"]
     styles = {
@@ -1428,12 +1658,12 @@ def figure_transfer(paired: pd.DataFrame, transfer: pd.DataFrame, paired_tasks: 
     spearman = correlation[correlation["backbone"] == "mean"].set_index("config")["spearman"]
     for config in configs:
         part = per_task[per_task["config"] == config]
-        right.plot(part["n_documents"], part["retention_change"] * 100, linestyle="none", color=INK, markersize=5, label=f"{config} ($\\rho$ = {spearman[config]:.2f})", **styles[config])
+        right.plot(part["n_documents"], part["retention_change"] * 100, linestyle="none", color=INK, markersize=5, label=f"{config} ($\\rho$ = {rho_label(spearman[config])})", **styles[config])
     right.axhline(0, color=GRAY, linewidth=0.8)
     right.set_xscale("log")
     right.set_xlabel("Documents in the BEIR corpus")
     right.set_ylabel("Retention, BEIR $-$ NanoBEIR (pp)")
-    corner_label(right, "(b)")
+    corner_label(right, "(b)", "upper right")  # the smallest corpora sit at the upper left
     right.legend(loc="lower left", fontsize=6.5)
     return figure
 
@@ -1494,7 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
 
     table_backbones(output)
     table_storage(output, cells["beir"])
-    table_evaluation_sets(output, frozen)
+    task_sizes = table_evaluation_sets(output, frozen)
     table_baselines(output, ledger, rows, impresso_r5)
     gap = prefix_gap_seeds(cells["beir"], beir_seeds)
     table_prefix_gap(output, ledger, gap)
@@ -1509,14 +1739,18 @@ def main(argv: list[str] | None = None) -> int:
     table_scale_cost(output, ledger, scale, transfer, paired)
     table_impresso(output, rows["impresso"], impresso_r5)
 
-    gains = {}
+    gains, subtracted = {}, {}
     for name in ("nanobeir", "beir", "impresso"):
-        subtracted = analysis.cell_summary(frozen.subtracted_rows(name))
-        gains[name] = pca_mean_gain(cells[name], subtracted).assign(set=name)
+        subtracted[name] = analysis.cell_summary(frozen.subtracted_rows(name))
+        gains[name] = pca_mean_gain(cells[name], subtracted[name]).assign(set=name)
     table_pca_mean(output, ledger, gains)
+    configuration_counts(ledger, cells, subtracted)
+    seed_counts(ledger, {"nanobeir": nano_seeds, "beir": beir_seeds}).to_csv(args.out / "tables" / "seed_counts.csv", index=False)
     pd.concat(gains.values(), ignore_index=True).to_csv(args.out / "tables" / "T12_cells.csv", index=False)
 
-    table_task_types(output, ledger, cells["beir"], task_type_cells(frozen.frame("nonretrieval")))
+    types = task_type_cells(frozen.frame("nonretrieval"))
+    table_task_types(output, ledger, cells["beir"], types)
+    noise_floors(ledger, cells, types).to_csv(args.out / "tables" / "noise_floors.csv", index=False)
 
     pairs = expansion_pairs(frozen, "main_score")
     recall_pairs = expansion_pairs(frozen, "recall_at_5")
@@ -1533,8 +1767,9 @@ def main(argv: list[str] | None = None) -> int:
     paired_tasks = analysis.paired_tiers(losses, "nanobeir", "beir")
     sizes = analysis.corpus_sizes(analysis.task_splits(large))
     correlation = analysis.size_correlation(paired_tasks, sizes, value="retention_change")
+    results_numbers(ledger, cells, rows, beir_seeds, paired, task_sizes)
     for config, value in correlation[correlation["backbone"] == "mean"].set_index("config")["spearman"].items():
-        if REFERENCE[config][0] != "none":
+        if REFERENCE[config][0] != "none" or config == "Full / binary":  # binary: the one quantizer with a size effect
             ledger.add(("sizeCorrelation", config), rho(value), FILES["beir"] + " + " + FILES["nanobeir"], "13 shared datasets; mean over backbones per dataset", "Spearman of retention change (BEIR - NanoBEIR) against log10 BEIR documents")
     paired_tasks.to_csv(args.out / "tables" / "F5b_paired_tasks.csv", index=False)
     correlation.to_csv(args.out / "tables" / "F5b_correlation.csv", index=False)
